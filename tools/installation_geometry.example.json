@@ -1,0 +1,8 @@
+{
+  "lever_x_m": 0.0,
+  "lever_y_m": 0.0,
+  "heading_offset_deg": 0.0,
+  "gyro_heading_sign": 1,
+  "imu_y_right_sign": 1,
+  "gnss_delay_ms": 0.0
+}

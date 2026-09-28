@@ -1,0 +1,18 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Keil build output and machine-specific settings
+MDK-ARM/TerraMind_MSDF/
+MDK-ARM/*.log
+MDK-ARM/*.lst
+MDK-ARM/*.uvoptx
+MDK-ARM/*.uvguix.*
+
+# Editor and operating-system files
+.vs/
+.vscode/
+.DS_Store
+Thumbs.db
