@@ -16,3 +16,6 @@ MDK-ARM/*.uvguix.*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Standalone navigation verification artifacts (never sensor logs)
+build-navigation/

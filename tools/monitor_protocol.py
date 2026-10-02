@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Tuple
+from capture_profile import CaptureProfile, delta_scales
+from startup_calibration import parse_calibration
 
 
 STATUS_FIELDS = (
@@ -59,6 +61,13 @@ class Imu:
     @property
     def accel_g(self) -> Tuple[float, ...]:
         return tuple(v / (2500 * 65536) for v in self.values[3:]) if self.mode == 2 else ()
+
+    def increments(self, delta_ctrl: int) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+        if self.mode != 3:
+            return (), ()
+        angle, velocity = delta_scales(delta_ctrl)
+        return (tuple(v * angle for v in self.values[:3]),
+                tuple(v * velocity for v in self.values[3:]))
 
 
 @dataclass
@@ -123,6 +132,11 @@ class MonitorModel:
         self.imu_count_gaps = 0
         self.record_errors = 0
         self.unknown_lines = 0
+        self.observed_modes: set[int] = set()
+        self.imu_sensor_fault_at = -1e9
+        self.calibration = None
+        self.imu_dt_s = None
+        self.last_drdy = None
         self.counts: Counter[str] = Counter()
 
     def feed(self, line: str, at: float) -> None:
@@ -132,6 +146,12 @@ class MonitorModel:
         try:
             if line.startswith("V,"):
                 self.version = line
+            elif line.startswith("B,"):
+                calibration = parse_calibration(line)
+                if self.calibration and self.calibration.identity() != calibration.identity():
+                    self.local_fault_at = at
+                self.calibration = calibration
+                self.counts["B"] += 1
             elif line.startswith("I,"):
                 fields = line.split(",")
                 if len(fields) != 13:
@@ -140,6 +160,9 @@ class MonitorModel:
                 sample = Imu(*data[:6], data[6:])
                 if sample.mode not in (2, 3) or not 0 <= sample.count <= 65535:
                     raise ValueError("IMU mode/count")
+                self.observed_modes.add(sample.mode)
+                if sample.flag & 0x0101:
+                    self.imu_sensor_fault_at = at
                 if self.imu is not None:
                     delta_ms = sample.mcu_ms - self.imu.mcu_ms
                     delta_count = (sample.count - self.imu.count) & 0xFFFF
@@ -147,6 +170,7 @@ class MonitorModel:
                         self.imu_count_gaps += 1
                         self.local_fault_at = at
                 self.imu = sample
+                self.imu_dt_s = None
                 self.imu_at = at
                 self.imu_times.append((at, sample.mcu_ms))
                 self.counts["I"] += 1
@@ -230,6 +254,14 @@ class MonitorModel:
                 if values[2] == 0:
                     self.imu_timed_missing += 1
                     self.local_fault_at = at
+                    self.last_drdy = None
+                else:
+                    ticks = (values[3] << 32) | values[4]
+                    if (self.last_drdy and values[2] == self.last_drdy[0] + 1 and
+                            self.imu and (values[0], values[1]) == (self.imu.mcu_ms, self.imu.count)):
+                        dt = (ticks - self.last_drdy[1]) / 4_000_000
+                        self.imu_dt_s = dt if 0.004 <= dt <= 0.006 else None
+                    self.last_drdy = (values[2], ticks)
                 self.counts["T"] += 1
             elif line.startswith("R,"):
                 values = [int(x) for x in line.split(",")[1:]]
@@ -284,9 +316,23 @@ class MonitorModel:
 
     def assess(self, now: float, pos_std_limit: float = 0.2,
                heading_std_limit: float = 2.0,
-               expected_baseline: Optional[float] = None) -> Tuple[bool, List[str], List[str]]:
+               expected_baseline: Optional[float] = None,
+               profile: Optional[CaptureProfile] = None) -> Tuple[bool, List[str], List[str]]:
         issues: List[str] = []
         warnings: List[str] = []
+        if profile is not None:
+            profile.validate()
+            if self.imu is not None and self.imu.mode != profile.expected_mode:
+                issues.append(f"IMU 模式不符：期望 {profile.expected_mode}，收到 {self.imu.mode}")
+            if profile.expected_mode == 3 and not profile.delta_ctrl_confirmed:
+                issues.append("DLT_CTRL 尚未按传感器实际寄存器核对")
+            if self.calibration and (self.calibration.mode != profile.expected_mode or
+                    self.calibration.mode == 3 and self.calibration.delta_ctrl != profile.delta_ctrl):
+                issues.append("板端标定配置与上位机采集配置不一致")
+        if len(self.observed_modes) > 1:
+            issues.append("本次连接混有模式 2/3，请重新连接并分段采集")
+        if now - self.imu_sensor_fault_at < 5:
+            issues.append("近 5 秒 IMU 报告传感器错误或超量程")
         def good_pos(pos: Position) -> bool:
             return (pos.time_status == "FINE" and pos.status == "SOL_COMPUTED" and pos.solution == "NARROW_INT"
                     and max(pos.lat_std_m, pos.lon_std_m) <= pos_std_limit

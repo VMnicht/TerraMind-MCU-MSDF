@@ -6,6 +6,7 @@
 #include "usart.h"
 
 #include <stdio.h>
+#include <cmath>
 
 extern "C" {
 MonitorTxStats g_monitor_debug_tx = {};
@@ -13,21 +14,63 @@ volatile uint32_t g_monitor_format_errors = 0u;
 volatile uint32_t g_monitor_started = 0u;
 }
 
+static void output_calibration()
+{
+    GyroCalibrationResult result;
+    App_ImuGetCalibration(&result);
+    if (result.state != GYRO_CAL_READY) return;
+    // Integer wire units: rad/s * 1e9, duration microseconds, temperature mC.
+    // The mean contains Earth rotation; raw I records are NOT bias corrected.
+    char record[224];
+    const int n=snprintf(record,sizeof(record),
+        "B,1,%lu,%u,%u,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld\r\n",
+        static_cast<unsigned long>(HAL_GetTick()),static_cast<unsigned>(App_ImuGetMode()),
+        static_cast<unsigned>(App_ImuGetDeltaCtrl()),static_cast<unsigned long>(result.samples),
+        static_cast<unsigned long>(std::lround(result.duration_s*1e6)),
+        std::lround(result.stationary_rate[0]*1e9),std::lround(result.stationary_rate[1]*1e9),
+        std::lround(result.stationary_rate[2]*1e9),std::lround(result.rate_std[0]*1e9),
+        std::lround(result.rate_std[1]*1e9),std::lround(result.rate_std[2]*1e9),
+        std::lround(result.temperature_c*1e3));
+    if(n>0 && static_cast<size_t>(n)<sizeof(record))
+        MonitorUart6Dma::instance().enqueue(record,static_cast<size_t>(n));
+    else ++g_monitor_format_errors;
+}
+
+void Monitor_Pause()
+{
+    g_monitor_started=0;
+    MonitorUart6Dma::instance().stop();
+}
+
 bool Monitor_Init()
 {
+    if (!App_ImuCalibrationReady()) return false;
     const bool started = MonitorUart6Dma::instance().start(&huart6);
     g_monitor_started = started ? 1u : 0u;
     if (started)
     {
-        static const char version[] = "V,2,921600,4000000\r\n";
-        MonitorUart6Dma::instance().enqueue(version, sizeof(version) - 1u);
+        char version[48];
+        const int length = snprintf(version, sizeof(version), "V,2,921600,%lu\r\n",
+            static_cast<unsigned long>(TIME_SYNC_TIMER_HZ));
+        if (length > 0 && static_cast<size_t>(length) < sizeof(version))
+            MonitorUart6Dma::instance().enqueue(version, static_cast<size_t>(length));
+        else ++g_monitor_format_errors;
+        output_calibration();
     }
     return started;
 }
 
 void Monitor_Step()
 {
-    if (g_monitor_started == 0u) return;
+    if (g_monitor_started == 0u)
+    {
+        // Keep capture FIFOs drained during the silent startup. History used by
+        // DRDY matching and PPS/GPS binding is maintained independently.
+        TimeSyncEdge discarded;
+        while (TimeSync_PopDrdy(&discarded)) {}
+        while (TimeSync_PopPps(&discarded)) {}
+        return;
+    }
     static uint32_t last_status_ms = 0u;
     const uint32_t now = HAL_GetTick();
     MonitorUart6Dma &tx = MonitorUart6Dma::instance();
@@ -61,6 +104,7 @@ void Monitor_Step()
     if (now - last_status_ms >= 1000u)
     {
         last_status_ms = now;
+        output_calibration();
         AppImuStats imu;
         Um982AppStats gnss;
         App_ImuGetStats(&imu);
@@ -120,6 +164,18 @@ void Monitor_OnImuSample(const G365Imu::Sample &sample, void *context)
 {
     (void)context;
     if (g_monitor_started == 0u) return;
+    const uint64_t uart_ticks = TimeSync_ExpandCounter(sample.uart_end_counter);
+    TimeSyncEdge drdy = {};
+    const bool matched = uart_ticks != 0u &&
+                         TimeSync_MatchDrdy(sample.uart_end_counter, &drdy) != 0u;
+    if (uart_ticks == 0u) TimeSync_RecordUnmatched();
+    Monitor_OnImuTimedSample(sample,matched ? &drdy : NULL,uart_ticks);
+}
+
+void Monitor_OnImuTimedSample(const G365Imu::Sample &sample, const TimeSyncEdge *drdy,
+                              uint64_t uart_ticks)
+{
+    if (g_monitor_started == 0u) return;
     const int32_t *first = sample.mode == G365Imu::Mode::Raw32 ?
                            sample.gyro : sample.delta_angle;
     const int32_t *second = sample.mode == G365Imu::Mode::Raw32 ?
@@ -142,19 +198,14 @@ void Monitor_OnImuSample(const G365Imu::Sample &sample, void *context)
         return;
     }
     MonitorUart6Dma::instance().enqueue(record, static_cast<size_t>(length));
-    const uint64_t uart_ticks = TimeSync_ExpandCounter(sample.uart_end_counter);
-    TimeSyncEdge drdy = {};
-    const bool matched = uart_ticks != 0u &&
-                         TimeSync_MatchDrdy(sample.uart_end_counter, &drdy) != 0u;
-    if (uart_ticks == 0u) TimeSync_RecordUnmatched();
     char timing_record[128];
     const int timing_length = snprintf(timing_record, sizeof(timing_record),
         "T,%lu,%u,%lu,%lu,%lu,%lu,%lu\r\n",
         static_cast<unsigned long>(sample.received_at_ms),
         static_cast<unsigned>(sample.count),
-        static_cast<unsigned long>(matched ? drdy.sequence : 0u),
-        static_cast<unsigned long>(matched ? drdy.ticks >> 32 : 0u),
-        static_cast<unsigned long>(matched ? drdy.ticks : 0u),
+        static_cast<unsigned long>(drdy ? drdy->sequence : 0u),
+        static_cast<unsigned long>(drdy ? drdy->ticks >> 32 : 0u),
+        static_cast<unsigned long>(drdy ? drdy->ticks : 0u),
         static_cast<unsigned long>(uart_ticks >> 32),
         static_cast<unsigned long>(uart_ticks));
     if (timing_length > 0 && static_cast<size_t>(timing_length) < sizeof(timing_record))
@@ -167,7 +218,7 @@ void Monitor_OnGnssBytes(const uint8_t *bytes, const uint32_t *timer_counters,
                          size_t length,
                          uint32_t received_at_ms)
 {
-    if (g_monitor_started == 0u || bytes == NULL || timer_counters == NULL) return;
+    if (bytes == NULL || timer_counters == NULL) return;
     static char line[384];
     static size_t used = 0u;
     static bool dropping = false;
@@ -175,7 +226,7 @@ void Monitor_OnGnssBytes(const uint8_t *bytes, const uint32_t *timer_counters,
     {
         if (bytes[i] == '\n')
         {
-            if (!dropping && used != 0u)
+            if (g_monitor_started != 0u && !dropping && used != 0u)
             {
                 if (line[used - 1u] == '\r') --used;
                 line[used] = '\0';

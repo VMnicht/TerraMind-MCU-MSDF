@@ -1,19 +1,94 @@
 #include "app_main.h"
+#include "imu_capture_config.h"
 
 #include "../BSP/imu_uart_bsp.h"
 #include "../Driver/g365_imu.h"
 #include "monitor_app.h"
+#include "um982_app.h"
 #include "usart.h"
 
 #include <new>
 #include <string.h>
+#include <cmath>
 
 // Construct only after HAL/peripheral initialization; no IMU code runs before main().
 alignas(G365Imu) static unsigned char g_imu_storage[sizeof(G365Imu)];
 static G365Imu *g_imu = NULL;
-static volatile uint32_t g_requested_imu_mode = APP_IMU_MODE_RAW32;
-static volatile uint32_t g_requested_delta_ctrl = 0x00ccu;
+static volatile uint32_t g_requested_imu_mode = IMU_CAPTURE_DEFAULT_MODE;
+static volatile uint32_t g_requested_delta_ctrl = IMU_CAPTURE_DELTA_CTRL;
 extern "C" volatile uint32_t g_imu_debug_stage = 0u;
+static GyroBiasCalibration g_calibration;
+static_assert(IMU_GYRO_CALIBRATION_SECONDS>=1.0 && IMU_GYRO_CALIBRATION_SECONDS<=30.0,
+              "Startup calibration duration must be between 1 and 30 seconds");
+static uint64_t g_previous_drdy_ticks = 0;
+static uint32_t g_previous_drdy_sequence = 0;
+static uint16_t g_previous_count = 0;
+extern "C" {
+GyroCalibrationResult g_gyro_calibration_debug = {};
+AppImuCorrected g_imu_corrected_debug = {};
+}
+
+static void reset_calibration()
+{
+    Monitor_Pause();
+    GyroBiasCalibration::Config config = GyroBiasCalibration::defaults();
+    config.duration_s = IMU_GYRO_CALIBRATION_SECONDS;
+    g_calibration.reset(config);
+    g_previous_drdy_ticks = 0;
+    g_previous_drdy_sequence = 0;
+    g_gyro_calibration_debug = g_calibration.result();
+    g_imu_corrected_debug = AppImuCorrected{};
+}
+
+static void on_imu_sample(const G365Imu::Sample &sample, void *)
+{
+    // Consume the DRDY match exactly once, shared by calibration and T logging.
+    const uint64_t uart_ticks = TimeSync_ExpandCounter(sample.uart_end_counter);
+    TimeSyncEdge drdy = {};
+    const bool matched = uart_ticks != 0 && TimeSync_MatchDrdy(sample.uart_end_counter, &drdy);
+    if (uart_ticks == 0) TimeSync_RecordUnmatched();
+    const uint16_t step = static_cast<uint16_t>(sample.count - g_previous_count);
+    const bool had_previous = g_previous_drdy_ticks != 0;
+    const bool continuous = matched && g_previous_drdy_ticks != 0 &&
+        drdy.ticks > g_previous_drdy_ticks && drdy.sequence == g_previous_drdy_sequence + 1 &&
+        (step == 312 || step == 313);
+    const double dt = continuous ? double(drdy.ticks-g_previous_drdy_ticks)/TIME_SYNC_TIMER_HZ : 0;
+    g_previous_drdy_ticks = matched ? drdy.ticks : 0;
+    g_previous_drdy_sequence = drdy.sequence;
+    g_previous_count = sample.count;
+    const double rad = 3.14159265358979323846/180;
+    double angle[3], velocity[3];
+    const uint16_t ctrl = g_imu->delta_ctrl();
+    const double angle_scale = rad/(66.0*2000*65536)*(1u<<((ctrl>>4)&15));
+    const double velocity_scale = (0.4e-3*9.80665)/(2000*65536)*(1u<<(ctrl&15));
+    for (unsigned i=0;i<3;++i) {
+        angle[i] = sample.mode == G365Imu::Mode::Delta32 ? sample.delta_angle[i]*angle_scale :
+            sample.gyro[i]*(rad/(66.0*65536))*dt;
+        velocity[i] = sample.mode == G365Imu::Mode::Delta32 ? sample.delta_velocity[i]*velocity_scale :
+            sample.accel[i]*(9.80665/(2500.0*65536))*dt;
+    }
+    Um982Position position;
+    const bool moving = App_Um982GetPosition(&position) && position.velocity_valid &&
+        sample.received_at_ms-position.received_at_ms<=500u &&
+        (position.horizontal_speed_mps>0.2f || std::abs(position.vertical_speed_mps)>0.2f);
+    if (!continuous) {
+        // The first matched frame is an expected time seed, not a lost interval.
+        if (had_previous || !matched) g_calibration.invalidate(GYRO_CAL_TIMING);
+    }
+    else g_calibration.push(angle,velocity,dt,sample.temperature_c,(sample.flag&0x0101)==0,moving);
+    g_gyro_calibration_debug = g_calibration.result();
+    g_imu_corrected_debug.valid = 0;
+    if (continuous && dt>=0.004 && dt<=0.006 && (sample.flag&0x0101)==0 && App_ImuCalibrationReady()) {
+        for (unsigned i=0;i<3;++i) {
+            g_imu_corrected_debug.delta_angle_rad[i] = angle[i]-g_gyro_calibration_debug.stationary_rate[i]*dt;
+            g_imu_corrected_debug.delta_velocity_mps[i] = velocity[i];
+        }
+        g_imu_corrected_debug.dt_s = dt;
+        g_imu_corrected_debug.received_at_ms = sample.received_at_ms;
+        g_imu_corrected_debug.valid = 1;
+    }
+    Monitor_OnImuTimedSample(sample,matched ? &drdy : NULL,uart_ticks);
+}
 
 extern "C" uint8_t App_ImuInit(void)
 {
@@ -28,7 +103,8 @@ extern "C" uint8_t App_ImuInit(void)
     }
     g_imu->set_mode(static_cast<G365Imu::Mode>(g_requested_imu_mode));
     g_imu->set_delta_ctrl(static_cast<uint16_t>(g_requested_delta_ctrl));
-    g_imu->set_sample_callback(Monitor_OnImuSample, NULL);
+    reset_calibration();
+    g_imu->set_sample_callback(on_imu_sample, NULL);
     g_imu_debug_stage = 2u;
     const bool armed = ImuUartBsp::instance().start(&huart4);
     if (armed)
@@ -55,6 +131,7 @@ extern "C" void App_ImuStep(void)
         while (bus.read(discarded, sizeof(discarded)) != 0u) {}
         g_imu->set_mode(static_cast<G365Imu::Mode>(g_requested_imu_mode));
         g_imu->set_delta_ctrl(static_cast<uint16_t>(g_requested_delta_ctrl));
+        reset_calibration();
         g_imu_debug_stage = 4u;
     }
     if (g_imu_debug_stage < 4u)
@@ -93,6 +170,19 @@ extern "C" void App_ImuSetDeltaCtrl(uint16_t value)
 extern "C" void App_ImuSetGlobCmd3(uint16_t value)
 {
     App_ImuSetDeltaCtrl(value);
+}
+
+extern "C" uint8_t App_ImuCalibrationReady(void) {
+    return g_calibration.result().state == GYRO_CAL_READY;
+}
+extern "C" void App_ImuGetCalibration(GyroCalibrationResult *result) {
+    if (result) *result = g_calibration.result();
+}
+extern "C" uint16_t App_ImuGetDeltaCtrl(void) { return static_cast<uint16_t>(g_requested_delta_ctrl); }
+extern "C" AppImuMode App_ImuGetMode(void) { return static_cast<AppImuMode>(g_requested_imu_mode); }
+extern "C" uint8_t App_ImuGetCorrected(AppImuCorrected *sample) {
+    if (!sample || !g_imu_corrected_debug.valid) return 0;
+    *sample=g_imu_corrected_debug;return 1;
 }
 
 extern "C" uint8_t App_ImuGetLatest(AppImuSample *sample)

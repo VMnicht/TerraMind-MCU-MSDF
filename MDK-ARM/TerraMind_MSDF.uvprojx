@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_PWR_LDO_SUPPLY,USE_HAL_DRIVER,STM32H743xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32H7xx_HAL_Driver/Inc;../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32H7xx/Include;../Drivers/CMSIS/Include;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/RTOS2/Include;../Middlewares/ST/STM32_MotionAC_Library/Inc;../Middlewares/ST/STM32_MotionAW_Library/Inc;../Middlewares/ST/STM32_MotionEC_Library/Inc;../Middlewares/ST/STM32_MotionFX_Library/Inc;../Middlewares/ST/STM32_MotionGC_Library/Inc;../Middlewares/ST/STM32_MotionID_Library/Inc;../Middlewares/ST/STM32_MotionMC_Library/Inc;../Middlewares/ST/STM32_MotionPM_Library/Inc;../Middlewares/ST/STM32_MotionPW_Library/Inc;../Middlewares/ST/STM32_MotionTL_Library/Inc;../Middlewares/ST/ARM/DSP/Inc</IncludePath>
+              <IncludePath>../TerraMind_FW/Navigation/core;../KF-GINS/ThirdParty/eigen-3.3.9;../Core/Inc;../Drivers/STM32H7xx_HAL_Driver/Inc;../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32H7xx/Include;../Drivers/CMSIS/Include;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/RTOS2/Include;../Middlewares/ST/STM32_MotionAC_Library/Inc;../Middlewares/ST/STM32_MotionAW_Library/Inc;../Middlewares/ST/STM32_MotionEC_Library/Inc;../Middlewares/ST/STM32_MotionFX_Library/Inc;../Middlewares/ST/STM32_MotionGC_Library/Inc;../Middlewares/ST/STM32_MotionID_Library/Inc;../Middlewares/ST/STM32_MotionMC_Library/Inc;../Middlewares/ST/STM32_MotionPM_Library/Inc;../Middlewares/ST/STM32_MotionPW_Library/Inc;../Middlewares/ST/STM32_MotionTL_Library/Inc;../Middlewares/ST/ARM/DSP/Inc</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -465,11 +465,6 @@
                   </Cads>
                 </FileArmAds>
               </FileOption>
-            </File>
-            <File>
-              <FileName>spi.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/spi.c</FilePath>
             </File>
             <File>
               <FileName>tim.c</FileName>
@@ -643,16 +638,6 @@
               <FilePath>../Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_exti.c</FilePath>
             </File>
             <File>
-              <FileName>stm32h7xx_hal_spi.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_spi.c</FilePath>
-            </File>
-            <File>
-              <FileName>stm32h7xx_hal_spi_ex.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_spi_ex.c</FilePath>
-            </File>
-            <File>
               <FileName>stm32h7xx_hal_uart.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart.c</FilePath>
@@ -691,6 +676,16 @@
               <FileName>app_main.cpp</FileName>
               <FileType>8</FileType>
               <FilePath>../TerraMind_FW/App/app_main.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>gyro_bias_calibration.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/App/gyro_bias_calibration.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>gyro_bias_calibration.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../TerraMind_FW/App/gyro_bias_calibration.h</FilePath>
             </File>
             <File>
               <FileName>app_main.h</FileName>
@@ -953,6 +948,31 @@
               <FileName>port.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F/port.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>Navigation (dormant library)</GroupName>
+          <Files>
+            <File>
+              <FileName>navigation.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/Navigation/navigation.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>gi_engine.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/Navigation/core/kf-gins/gi_engine.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>insmech.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/Navigation/core/kf-gins/insmech.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>navigation.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../TerraMind_FW/Navigation/navigation.h</FilePath>
             </File>
           </Files>
         </Group>

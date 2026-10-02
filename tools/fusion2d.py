@@ -92,6 +92,13 @@ class ReplayFrame:
     vn_mps: float
     heading_deg: float
     gyro_bias_dps: float
+    height_m: Optional[float] = None
+    roll_deg: Optional[float] = None
+    pitch_deg: Optional[float] = None
+    lat_deg: Optional[float] = None
+    lon_deg: Optional[float] = None
+    vd_mps: Optional[float] = None
+    gps_week: Optional[int] = None
 
 
 @dataclass

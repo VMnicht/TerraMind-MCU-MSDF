@@ -9,11 +9,13 @@ import queue
 import re
 import threading
 import time
+from math import degrees
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from monitor_protocol import MonitorModel
+from capture_profile import CaptureProfile, RawCapture, load_capture
 
 
 class InputWorker(threading.Thread):
@@ -29,17 +31,21 @@ class InputWorker(threading.Thread):
         self.dropped = 0
         self.error = ""
 
-    def start_capture(self, path: Path) -> None:
+    def start_capture(self, path: Path, profile: CaptureProfile) -> None:
         with self.capture_lock:
             if self.capture is not None:
                 self.capture.close()
-            self.capture = path.open("wb")
+            self.capture = RawCapture(path, profile)
 
     def stop_capture(self) -> None:
         with self.capture_lock:
             if self.capture is not None:
-                self.capture.close()
+                capture = self.capture
                 self.capture = None
+                try:
+                    capture.close(self.error)
+                except OSError as exc:
+                    self.error = f"日志/配套配置保存失败：{exc}"
 
     def emit(self, line: str) -> None:
         try:
@@ -89,7 +95,6 @@ class InputWorker(threading.Thread):
                 with self.capture_lock:
                     if self.capture is not None:
                         self.capture.write(block)
-                        self.capture.flush()
                 pending.extend(block)
                 while b"\n" in pending:
                     row, _, remainder = pending.partition(b"\n")
@@ -104,8 +109,8 @@ class Dashboard:
     def __init__(self, root: tk.Tk, replay: Optional[Path] = None) -> None:
         self.root = root
         root.title("TerraMind IMU / UM982 监视与采集")
-        root.geometry("1080x770")
-        root.minsize(900, 650)
+        root.geometry("1180x900")
+        root.minsize(1080, 850)
         self.model = MonitorModel()
         self.inbox: queue.Queue = queue.Queue(maxsize=4000)
         self.worker: Optional[InputWorker] = None
@@ -116,6 +121,11 @@ class Dashboard:
         self.pos_limit_text = tk.StringVar(value="0.20")
         self.hdg_limit_text = tk.StringVar(value="2.0")
         self.baseline_text = tk.StringVar(value="")
+        self.mode_text = tk.StringVar(value="3")
+        self.delta_ctrl_text = tk.StringVar(value=f"0x{CaptureProfile().delta_ctrl:04X}")
+        self.delta_confirmed = tk.BooleanVar(value=False)
+        self.delta_ctrl_text.trace_add("write", lambda *_: self.delta_confirmed.set(False))
+        self.capture_profile: Optional[CaptureProfile] = None
         self.banner_text = tk.StringVar(value="等待数据")
         self.reason_text = tk.StringVar(value="连接串口或回放日志后开始判断。")
         self.warning_text = tk.StringVar()
@@ -123,6 +133,7 @@ class Dashboard:
         self.pos_text = tk.StringVar()
         self.hdg_text = tk.StringVar()
         self.link_text = tk.StringVar()
+        self.calibration_text = tk.StringVar(value="上电静止标定期间板端保持串口静默；请保持静止至出现数据。")
         self._build()
         self.refresh_ports()
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -164,6 +175,22 @@ class Dashboard:
         ttk.Label(settings, text="°   实测基线（可选）").pack(side="left")
         ttk.Entry(settings, textvariable=self.baseline_text, width=7).pack(side="left")
         ttk.Label(settings, text="m；高程标准差 ≤0.5 m，连续 5 s，基线波动 ≤0.1 m").pack(side="left", padx=5)
+
+        profile_row = ttk.Frame(main)
+        profile_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(profile_row, text="期望模式").pack(side="left")
+        self.mode_choice = ttk.Combobox(profile_row, textvariable=self.mode_text,
+                                       values=("3", "2"), width=3, state="readonly")
+        self.mode_choice.pack(side="left", padx=5)
+        ttk.Label(profile_row, text="3=增量 / 2=原始；200 Hz   DLT_CTRL").pack(side="left")
+        self.delta_entry = ttk.Entry(profile_row, textvariable=self.delta_ctrl_text, width=9)
+        self.delta_entry.pack(side="left", padx=5)
+        self.delta_check = ttk.Checkbutton(profile_row, text="已核对传感器实际寄存器",
+                                          variable=self.delta_confirmed)
+        self.delta_check.pack(side="left")
+        ttk.Label(profile_row, text="仅用于核对和换算，不向板子写配置", foreground="#6b7280").pack(side="left", padx=8)
+        ttk.Label(main, textvariable=self.calibration_text, wraplength=1100,
+                  foreground="#475569").pack(fill="x", pady=(0, 6))
 
         grid = ttk.Frame(main)
         grid.pack(fill="both", expand=True)
@@ -226,14 +253,17 @@ class Dashboard:
         self.connect_button.configure(text="断开")
 
     def _stop_worker(self) -> None:
+        error = ""
         if self.worker is not None:
             self.worker.stop_event.set()
             self.worker.join(timeout=0.5)
+            error = self.worker.error
             self.worker = None
         self.source_text.set("未连接")
-        self.capture_text.set("未采集")
+        self.capture_text.set(error or "未采集")
         self.capture_button.configure(text="开始保存原始日志")
         self.connect_button.configure(text="连接")
+        self._lock_profile(False)
 
     def toggle_connect(self) -> None:
         if self.worker is not None:
@@ -249,7 +279,35 @@ class Dashboard:
             self.open_replay(Path(name))
 
     def open_replay(self, path: Path) -> None:
+        try:
+            metadata = load_capture(path, verify_log=True)
+            profile = CaptureProfile(**metadata["profile"]) if metadata else CaptureProfile()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("采集配置错误", str(exc))
+            return
+        self.mode_text.set(str(profile.expected_mode))
+        self.delta_ctrl_text.set(f"0x{profile.delta_ctrl:04X}")
+        self.delta_confirmed.set(profile.delta_ctrl_confirmed)
         self._replace_worker(replay=path)
+
+    def _profile(self) -> CaptureProfile:
+        if self.capture_profile is not None:
+            return self.capture_profile
+        try:
+            profile = CaptureProfile(int(self.mode_text.get()),
+                                     int(self.delta_ctrl_text.get().strip(), 16),
+                                     self.delta_confirmed.get())
+            profile.validate()
+            return profile
+        except ValueError as exc:
+            raise ValueError(f"采集配置无效（DLT_CTRL 按十六进制填写）：{exc}") from exc
+
+    def _lock_profile(self, locked: bool) -> None:
+        self.mode_choice.configure(state="disabled" if locked else "readonly")
+        self.delta_entry.configure(state="disabled" if locked else "normal")
+        self.delta_check.configure(state="disabled" if locked else "normal")
+        if not locked:
+            self.capture_profile = None
 
     def toggle_capture(self) -> None:
         if self.worker is None or self.worker.replay is not None or not self.worker.is_alive():
@@ -257,19 +315,23 @@ class Dashboard:
             return
         if self.worker.capture is not None:
             self.worker.stop_capture()
-            self.capture_text.set("已停止保存")
+            self.capture_text.set(self.worker.error or "已停止保存（原始日志 + .capture.json）")
             self.capture_button.configure(text="开始保存原始日志")
+            self._lock_profile(False)
             return
         default = f"terramind_{datetime.now():%Y%m%d_%H%M%S}.txt"
         name = filedialog.asksaveasfilename(defaultextension=".txt", initialfile=default,
                                              filetypes=[("日志文本", "*.txt")])
         if name:
             try:
-                self.worker.start_capture(Path(name))
-            except OSError as exc:
+                profile = self._profile()
+                self.worker.start_capture(Path(name), profile)
+            except (OSError, ValueError) as exc:
                 messagebox.showerror("保存失败", str(exc))
                 return
             self.capture_text.set(str(name))
+            self.capture_profile = profile
+            self._lock_profile(True)
             self.capture_button.configure(text="停止保存")
 
     @staticmethod
@@ -312,16 +374,24 @@ class Dashboard:
                 self.last_worker_drop = self.worker.dropped
             if not self.worker.is_alive() and self.worker.error:
                 self.source_text.set(f"输入错误：{self.worker.error}")
+                self.capture_text.set(f"保存已停止：{self.worker.error}")
+                self._lock_profile(False)
+                self.capture_button.configure(text="开始保存原始日志")
+        profile = None
         try:
             pos_limit = float(self.pos_limit_text.get())
             hdg_limit = float(self.hdg_limit_text.get())
             baseline = float(self.baseline_text.get()) if self.baseline_text.get().strip() else None
             if pos_limit <= 0 or hdg_limit <= 0 or baseline is not None and baseline <= 0:
                 raise ValueError()
-            ready, issues, warnings = self.model.assess(now, pos_limit, hdg_limit, baseline)
-        except ValueError:
-            ready, issues, warnings = False, ["阈值必须为正数"], []
+            profile = self._profile()
+            ready, issues, warnings = self.model.assess(now, pos_limit, hdg_limit, baseline, profile)
+        except ValueError as exc:
+            ready, issues, warnings = False, [str(exc) or "阈值必须为正数"], []
             pos_limit, hdg_limit = 0.2, 2.0
+        if self.worker is not None and self.worker.error:
+            ready = False
+            issues.insert(0, self.worker.error)
         self.banner_text.set("● 可开始采集：传感器条件已满足" if ready else "● 尚未就绪")
         color = "#166534" if ready else "#991b1b"
         self.banner.configure(bg=color)
@@ -332,9 +402,34 @@ class Dashboard:
         self.reason_text.set("当前检查项均满足。" if ready else "原因：" + "；".join(issues[:5]))
         self.warning_text.set("；".join(warnings))
         imu = self.model.imu
+        calibration = self.model.calibration
+        if calibration:
+            mean_text = " / ".join(f"{degrees(v):+.6f}" for v in calibration.stationary_rate)
+            self.calibration_text.set(
+                f"板端启动标定完成：{calibration.duration_us / 1e6:.3f} s / {calibration.samples} 帧，"
+                f"静止均值 XYZ °/s：{mean_text}；I 日志保留原始值。")
+        else:
+            self.calibration_text.set("等待板端启动标定记录；上电保持静止至出现数据，旧固件无此记录。")
         if imu:
             axes = ("角速度 °/s: " + "  ".join(f"{x:+8.3f}" for x in imu.gyro_dps) + "\n"
                     "加速度 g : " + "  ".join(f"{x:+8.3f}" for x in imu.accel_g)) if imu.mode == 2 else "模式 3：原始增量值见日志"
+            if imu.mode == 3:
+                axes = "原始 Δθ: " + " ".join(map(str, imu.values[:3]))
+                axes += "\n原始 Δv: " + " ".join(map(str, imu.values[3:]))
+                if profile is not None:
+                    angle, velocity = imu.increments(profile.delta_ctrl)
+                    axes += "\nΔθ °: " + " ".join(f"{v:+.6g}" for v in angle)
+                    axes += "\nΔv m/s: " + " ".join(f"{v:+.6g}" for v in velocity)
+                    axes += f"\nDLT_CTRL=0x{profile.delta_ctrl:04X} " + (
+                        "人工已核对" if profile.delta_ctrl_confirmed else "未核对，仅供预览")
+                    if (calibration and calibration.mode == imu.mode and
+                            calibration.delta_ctrl == profile.delta_ctrl and self.model.imu_dt_s):
+                        corrected = [a-degrees(b)*self.model.imu_dt_s
+                                     for a,b in zip(angle, calibration.stationary_rate)]
+                        axes += "\n去静止均值 Δθ °: " + " ".join(f"{v:+.6g}" for v in corrected)
+            elif calibration and calibration.mode == 2:
+                corrected = [a-degrees(b) for a,b in zip(imu.gyro_dps, calibration.stationary_rate)]
+                axes += "\n去静止均值 °/s: " + " ".join(f"{v:+.6g}" for v in corrected)
             self.imu_text.set(f"更新距今: {self._age(now, self.model.imu_at)}\n"
                               f"模式: {imu.mode}    速率: {self.model.imu_rate(now):.1f} Hz\n"
                               f"COUNT: {imu.count}    FLAG: 0x{imu.flag:04X}\n"
@@ -398,13 +493,15 @@ class Dashboard:
 
 def analyze(path: Path) -> None:
     model = MonitorModel()
+    metadata = load_capture(path, verify_log=True)
+    profile = CaptureProfile(**metadata["profile"]) if metadata else CaptureProfile()
     last_at = 0.0
     for line in path.read_text(encoding="ascii", errors="replace").splitlines():
         match = re.match(r"^[INS],(\d+),", line)
         if match:
             last_at = int(match.group(1)) / 1000.0
         model.feed(line, last_at)
-    ready, issues, warnings = model.assess(last_at)
+    ready, issues, warnings = model.assess(last_at, profile=profile)
     print(f"IMU {model.counts['I']} | BESTNAVA {model.counts['BESTNAVA']} | "
           f"UNIHEADINGA {model.counts['UNIHEADINGA']} | 坏记录 {model.record_errors}")
     print(f"位置 {model.position.status}/{model.position.solution}" if model.position else "无位置")

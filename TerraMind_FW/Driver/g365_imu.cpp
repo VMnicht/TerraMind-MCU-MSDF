@@ -7,7 +7,7 @@ extern "C"
 G365Imu::Sample g_g365_debug_sample = {};
 }
 
-G365Imu::G365Imu() : mode_(Mode::Raw32), delta_ctrl_(0x00ccu),
+G365Imu::G365Imu() : mode_(Mode::Raw32), delta_ctrl_(0x0008u),
                      sample_callback_(NULL), callback_context_(NULL)
 {
     reset();

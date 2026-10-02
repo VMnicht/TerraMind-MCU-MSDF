@@ -26,6 +26,7 @@ class MonitorUart6Dma
 public:
     static MonitorUart6Dma &instance();
     bool start(UART_HandleTypeDef *uart);
+    void stop();
     bool enqueue(const char *record, size_t length);
     void service();
     MonitorTxStats stats() const;

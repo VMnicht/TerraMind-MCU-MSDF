@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+/* Fixed log/protocol timebase, independent of the CPU and APB clock rates. */
+#define TIME_SYNC_TIMER_HZ 4000000u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,7 +42,9 @@ typedef struct
     uint8_t locked; /* Conditional: PPS polarity/time reference must be verified. */
 } TimeSyncClockMap;
 
-/* Call after MX_TIM2_Init, before starting the scheduler. */
+/* Call after MX_TIM2_Init, before starting the scheduler.
+ * Rejects any clock/PSC combination that is not exactly TIME_SYNC_TIMER_HZ,
+ * or a counter that is not configured for full-range 32-bit up-counting. */
 uint8_t TimeSync_Init(void);
 /* Called at the beginning of TIM2_IRQHandler, before HAL_TIM_IRQHandler. */
 void TimeSync_OnTim2Irq(void);

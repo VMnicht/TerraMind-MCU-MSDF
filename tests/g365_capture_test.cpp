@@ -59,6 +59,9 @@ static void make_frame(uint8_t *out, uint16_t flag, int16_t temperature,
 int main()
 {
     G365Imu imu;
+    assert(imu.delta_ctrl() == 0x0008u);
+    // Keep coverage of the previous profile as an explicit, non-default setting.
+    imu.set_delta_ctrl(0x00ccu);
     imu.set_sample_callback(on_sample, NULL);
     G365Imu::Sample sample = {};
     assert(imu.mode() == G365Imu::Mode::Raw32);
@@ -150,5 +153,18 @@ int main()
     assert(near(sample.temperature_c, 25.0f, 0.00001f));
     assert(near(sample.accel_z_g, 1.0f, 0.000001f));
     assert(g_sample_callbacks == 6u);
+    // Actual 2026-10-02 capture, with independently read back DLT_CTRL=0x0008.
+    const uint8_t captured[] = {
+        0x80,0xfe,0xfc,0x07,0x64,0xff,0x05,0xc1,0x25,0x0a,0x50,0x1d,
+        0x3c,0xff,0x73,0xc5,0xfe,0x00,0x00,0x06,0x22,0xff,0xfc,0x84,
+        0xf1,0xff,0x9d,0x8b,0x09,0x02,0x00,0x73,0x13,0x3e,0x4f,0x0d
+    };
+    imu.set_mode(G365Imu::Mode::Delta32);
+    imu.set_delta_ctrl(0x0008u);
+    imu.feed(captured, sizeof(captured), 26u);
+    assert(imu.get_latest(sample));
+    assert(imu.get_stats().valid_frames == 1u);
+    assert(near(sample.delta_angle_y_deg, 0.0200008651f, 1e-8f));
+    assert(near(sample.delta_velocity_z_mps, -0.0494352537f, 1e-8f));
     return 0;
 }

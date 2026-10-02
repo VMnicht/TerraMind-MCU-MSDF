@@ -2,6 +2,7 @@
 #define APP_MAIN_H
 
 #include <stdint.h>
+#include "gyro_bias_calibration.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,6 +69,21 @@ void App_ImuSetDeltaCtrl(uint16_t value);
 /* Earlier G366-based name, retained for source compatibility. */
 void App_ImuSetGlobCmd3(uint16_t value);
 uint8_t App_ImuGetLatest(AppImuSample *sample);
+/* Single IMU-task owner. Raw App_ImuGetLatest and I logs are never corrected. */
+uint8_t App_ImuCalibrationReady(void);
+void App_ImuGetCalibration(GyroCalibrationResult *result);
+uint16_t App_ImuGetDeltaCtrl(void);
+AppImuMode App_ImuGetMode(void);
+/* Relative-to-startup stationary rate removed (including Earth rate).
+   Diagnostic only; NOT the raw input to KF-GINS. Units rad, m/s, seconds. */
+typedef struct {
+    double delta_angle_rad[3], delta_velocity_mps[3], dt_s;
+    uint32_t received_at_ms;
+    uint8_t valid;
+} AppImuCorrected;
+extern GyroCalibrationResult g_gyro_calibration_debug;
+extern AppImuCorrected g_imu_corrected_debug;
+uint8_t App_ImuGetCorrected(AppImuCorrected *sample);
 void App_ImuGetStats(AppImuStats *stats);
 
 #ifdef __cplusplus

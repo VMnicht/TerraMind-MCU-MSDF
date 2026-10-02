@@ -10,6 +10,13 @@
 
 UART_HandleTypeDef huart6 = {};
 static std::string g_output;
+static bool g_calibration_ready = false;
+extern "C" uint8_t App_ImuCalibrationReady(void) { return g_calibration_ready; }
+extern "C" uint16_t App_ImuGetDeltaCtrl(void) { return 0xCC; }
+extern "C" AppImuMode App_ImuGetMode(void) { return APP_IMU_MODE_DELTA32; }
+extern "C" void App_ImuGetCalibration(GyroCalibrationResult *result) {
+    *result={};result->state=GYRO_CAL_READY;result->samples=600;result->duration_s=3;
+}
 
 extern "C" uint32_t HAL_GetTick(void) { return 123u; }
 extern "C" uint64_t TimeSync_ExpandCounter(uint32_t counter) { return counter; }
@@ -34,11 +41,21 @@ extern "C" HAL_StatusTypeDef HAL_UART_AbortTransmit(UART_HandleTypeDef *)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 2);
+    assert(argc == 1 || argc == 2);
     huart6.hdmatx = &huart6;
+    assert(!Monitor_Init());
+    Monitor_Step();
+    assert(g_output.empty());
+    g_calibration_ready=true;
     assert(Monitor_Init());
-    FILE *file = fopen(argv[1], "rb");
+    FILE *file = argc == 2 ? fopen(argv[1], "rb") : tmpfile();
     assert(file != NULL);
+    if (argc == 1)
+    {
+        const char input[] = "#BESTNAVA,synthetic*12345678\r\n$GNGGA,synthetic*00\r\n";
+        assert(fwrite(input, 1u, sizeof(input) - 1u, file) == sizeof(input) - 1u);
+        rewind(file);
+    }
     uint8_t bytes[67];
     uint32_t timer_counters[67];
     for (size_t i = 0u; i < 67u; ++i) timer_counters[i] = 100u;
@@ -48,14 +65,15 @@ int main(int argc, char **argv)
         Monitor_OnGnssBytes(bytes, timer_counters, length, 123u);
         Monitor_Step();
     }
-    fclose(file);
     while (MonitorUart6Dma::instance().stats().queue_bytes != 0u) Monitor_Step();
 
     const std::string version = "V,2,921600,4000000\r\n";
     assert(g_output.compare(0, version.size(), version) == 0);
-    FILE *original = fopen(argv[1], "rb");
-    assert(original != NULL);
-    size_t cursor = version.size();
+    rewind(file);
+    FILE *original = file;
+    const std::string calibration="B,1,123,3,204,600,3000000,0,0,0,0,0,0,0\r\n";
+    assert(g_output.compare(version.size(),calibration.size(),calibration)==0);
+    size_t cursor = version.size()+calibration.size();
     char original_line[512];
     unsigned lines = 0u;
     while (fgets(original_line, sizeof(original_line), original) != NULL)
@@ -77,7 +95,7 @@ int main(int argc, char **argv)
         ++lines;
     }
     fclose(original);
-    assert(lines == 1320u && cursor == g_output.size());
+    assert(lines == (argc == 2 ? 1320u : 2u) && cursor == g_output.size());
     assert(MonitorUart6Dma::instance().stats().records_dropped == 0u);
 
     G365Imu::Sample sample = {};
@@ -90,6 +108,13 @@ int main(int argc, char **argv)
     Monitor_Step();
     assert(g_output.find("I,456,2,625,0,0,0,-123,0,0,0,0,789\r\n") != std::string::npos);
     assert(g_output.find("T,456,625,0,0,0,0,0\r\n") != std::string::npos);
+    sample.mode = G365Imu::Mode::Delta32;
+    sample.delta_angle[0] = INT32_MIN;
+    sample.delta_angle[1] = INT32_MAX;
+    sample.delta_velocity[2] = -400000;
+    Monitor_OnImuSample(sample, NULL);
+    Monitor_Step();
+    assert(g_output.find("I,456,3,625,0,0,0,-2147483648,2147483647,0,0,0,-400000\r\n") != std::string::npos);
     TimeSyncClockMap mapping = {};
     mapping.pps_sequence = 3u;
     mapping.gps_week = 2438u;

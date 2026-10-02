@@ -8,8 +8,11 @@
 #include <stdint.h>
 
 bool Monitor_Init();
+void Monitor_Pause();
 void Monitor_Step();
 void Monitor_OnImuSample(const G365Imu::Sample &sample, void *context);
+void Monitor_OnImuTimedSample(const G365Imu::Sample &sample, const TimeSyncEdge *drdy,
+                              uint64_t uart_ticks);
 void Monitor_OnGnssBytes(const uint8_t *bytes, const uint32_t *timer_counters,
                          size_t length,
                          uint32_t received_at_ms);

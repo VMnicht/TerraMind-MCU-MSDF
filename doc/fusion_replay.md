@@ -1,5 +1,7 @@
 # 二维组合导航离线回放
 
+基于武汉大学 KF-GINS 的三维增量式 IMU 版本见 [kf_gins_replay.md](kf_gins_replay.md)，从 `tools/start_kf_gins_replay.bat` 启动。当前工具仍处理模式 2 原始 IMU 日志。
+
 双击 `tools/start_fusion_replay.bat`，选择 USART6 原始日志（例如 `terramind_20260927_171734.txt`），填写安装几何，然后点“运行融合”。也可运行 `python tools/fusion_replay.py "日志路径"`。缺少依赖时执行 `python -m pip install -r tools/requirements.txt`。回放界面可播放、暂停、拖动时间轴；在 EN 平面图上用滚轮围绕鼠标位置缩放，用左键拖动平移，点“重置视图”恢复全图。融合轨迹上的蓝点可悬停查看该帧时间、平面坐标和速度。视野内点过密时会抽样绘制标记，放大后会显示更多细节。可导出逐帧融合 CSV；高程不参与显示。
 
 安装几何可在界面输入，并保存为 JSON，之后用“导入安装配置”复用。所有长度以米为单位。`lever_x_m`、`lever_y_m` 表示 **UM982 主天线相对 G365 测量中心**的位置，沿 IMU 的 +X 和 +Y 轴。`heading_offset_deg` 表示“IMU +X 的航向减去 UM982 主天线到副天线航向”，顺时针为正。`imu_y_right_sign` 为 +1 时视 IMU +Y 在 +X 的右侧，为 -1 时反向；`gyro_heading_sign` 为 +1 时 G365 Z 正角速度使航向顺时针增加。`gnss_delay_ms` 仅用于旧版 V1 日志，把 GNSS 历元相对于串口到达时间拟合出的时刻提前多少毫秒；有条件 PPS/DRDY 配对的 V2 回放使用 GNSS 历元本身，不用此值。当前旧日志的 Z 陀螺与 GNSS 顺时针航向变化呈正相关，因此默认 `gyro_heading_sign=+1`，但安装方向仍应实测核对。默认 0 杆臂仅供演示，不代表真实安装尺寸。

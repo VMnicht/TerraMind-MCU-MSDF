@@ -66,7 +66,22 @@ HAL_StatusTypeDef HAL_InitTick(uint32_t TickPriority)
   HAL_RCC_GetClockConfig(&clkconfig, &pFLatency);
 
   /* Compute TIM8 clock */
-      uwTimclock = 2*HAL_RCC_GetPCLK2Freq();
+  if ((RCC->CFGR & RCC_CFGR_TIMPRE) == 0U)
+  {
+    uwTimclock = clkconfig.APB2CLKDivider == RCC_APB2_DIV1 ?
+                 HAL_RCC_GetPCLK2Freq() : 2U * HAL_RCC_GetPCLK2Freq();
+  }
+  else
+  {
+    uwTimclock = (clkconfig.APB2CLKDivider == RCC_APB2_DIV1 ||
+                  clkconfig.APB2CLKDivider == RCC_APB2_DIV2 ||
+                  clkconfig.APB2CLKDivider == RCC_APB2_DIV4) ?
+                  HAL_RCC_GetHCLKFreq() : 4U * HAL_RCC_GetPCLK2Freq();
+  }
+  if (uwTimclock < 1000000U || uwTimclock % 1000000U != 0U)
+  {
+    return HAL_ERROR;
+  }
 
   /* Compute the prescaler value to have TIM8 counter clock equal to 1MHz */
   uwPrescalerValue = (uint32_t) ((uwTimclock / 1000000U) - 1U);

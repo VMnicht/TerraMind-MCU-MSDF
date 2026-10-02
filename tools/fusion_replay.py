@@ -75,6 +75,7 @@ class ReplayApp:
         ttk.Button(row, text="运行融合", command=self._run).pack(side="left", padx=(8, 0))
 
         geometry = ttk.LabelFrame(main, text="安装几何与时间参数（可导入 / 保存 JSON）", padding=8)
+        self.geometry_frame = geometry
         geometry.pack(fill="x", pady=(8, 0))
         for i, (key, title) in enumerate(LABELS):
             r, col = divmod(i, 3)
@@ -92,15 +93,18 @@ class ReplayApp:
                   foreground="#92400e").pack(side="right")
 
         calibration_row = ttk.Frame(main)
+        self.calibration_row = calibration_row
         calibration_row.pack(fill="x", pady=(7, 0))
         ttk.Checkbutton(calibration_row, text="启用前 3 秒静止 IMU 零位标定",
                         variable=self.calibrate_static_imu).pack(side="left")
         ttk.Label(calibration_row, text="需确认静止；勾选后点击“运行融合”重新计算",
                   foreground="#64748b").pack(side="left", padx=12)
-        ttk.Label(main, textvariable=self.calibration_text,
-                  foreground="#0f766e", wraplength=1100).pack(anchor="w", pady=(3, 0))
+        self.calibration_label = ttk.Label(main, textvariable=self.calibration_text,
+                                           foreground="#0f766e", wraplength=1100)
+        self.calibration_label.pack(anchor="w", pady=(3, 0))
 
         info = ttk.Frame(main)
+        self.info_frame = info
         info.pack(fill="x", pady=(8, 0))
         ttk.Label(info, textvariable=self.status, font=("Microsoft YaHei UI", 10, "bold"),
                   foreground="#1f2937").pack(anchor="w")
@@ -143,9 +147,10 @@ class ReplayApp:
         self.time_label = ttk.Label(controls, text="0.0 / 0.0 s", width=15)
         self.time_label.pack(side="right")
         ttk.Label(main, textvariable=self.metrics, font=("Consolas", 10)).pack(anchor="w", pady=(6, 0))
-        ttk.Label(main, text="实验性二维松组合：IMU 200 Hz 预测，UM982 10 Hz 位置 / 多普勒速度 / 双天线航向更新。"
-                  "未补偿横滚俯仰重力投影；PPS 的 GPS 整秒归属仍需核验，轨迹不能视为真值。",
-                  foreground="#6b7280", wraplength=1100).pack(anchor="w", pady=(3, 0))
+        self.model_note = ttk.Label(main, text="实验性二维松组合：IMU 200 Hz 预测，UM982 10 Hz 位置 / 多普勒速度 / 双天线航向更新。"
+                                    "未补偿横滚俯仰重力投影；PPS 的 GPS 整秒归属仍需核验，轨迹不能视为真值。",
+                                    foreground="#6b7280", wraplength=1100)
+        self.model_note.pack(anchor="w", pady=(3, 0))
 
     def _choose_log(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("USART6 日志", "*.txt"), ("全部文件", "*.*")])
@@ -198,8 +203,7 @@ class ReplayApp:
             geometry = self._geometry()
             self.root.configure(cursor="watch")
             self.root.update_idletasks()
-            result = run_fusion(path, geometry,
-                                calibrate_static_imu=self.calibrate_static_imu.get())
+            result = self._compute(path, geometry)
         except (OSError, ValueError) as exc:
             messagebox.showerror("融合失败", str(exc))
             return
@@ -253,10 +257,17 @@ class ReplayApp:
                 f"前 3 秒静止零位标定：未应用（{calibration.reason}）；"
                 "本次使用未预先扣零的 IMU 数据")
         notes = list(result.warnings)
-        if geometry.lever_x_m == geometry.lever_y_m == geometry.heading_offset_deg == 0:
+        if self._zero_geometry(geometry):
             notes.insert(0, "当前为零杆臂/零偏角演示；填写实测安装值后重新运行")
         self.warnings.set("；".join(notes))
         self._draw()
+
+    def _compute(self, path: Path, geometry: Geometry) -> FusionResult:
+        return run_fusion(path, geometry,
+                          calibrate_static_imu=self.calibrate_static_imu.get())
+
+    def _zero_geometry(self, geometry: Geometry) -> bool:
+        return geometry.lever_x_m == geometry.lever_y_m == geometry.heading_offset_deg == 0
 
     def _export_csv(self) -> None:
         if self.result is None:

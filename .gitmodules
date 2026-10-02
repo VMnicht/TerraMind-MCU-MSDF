@@ -1,0 +1,3 @@
+[submodule "KF-GINS"]
+	path = KF-GINS
+	url = https://github.com/i2Nav-WHU/KF-GINS.git

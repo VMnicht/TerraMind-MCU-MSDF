@@ -3,9 +3,12 @@
 #include "tim.h"
 #include <string.h>
 
-/* Current CubeMX clock: APB1=42 MHz, TIM2=84 MHz, PSC=20 -> 4 MHz.
+/* Current CubeMX clock: APB1=60 MHz, TIMPRE=0, TIM2=120 MHz,
+ * PSC=29 -> 4 MHz. The former 84 MHz / (20 + 1) setup is also valid.
  * A PPS period measures the real oscillator rate on each recording. */
-#define TIMER_HZ 4000000u
+#define TIMER_HZ TIME_SYNC_TIMER_HZ
+#define MIN_PPS_PERIOD_TICKS (TIMER_HZ - TIMER_HZ / 8u)
+#define MAX_PPS_PERIOD_TICKS (TIMER_HZ + TIMER_HZ / 8u)
 #define DRDY_QUEUE_SIZE 256u
 #define PPS_QUEUE_SIZE 16u
 #define HISTORY_SIZE 32u
@@ -42,9 +45,27 @@ static void unlock_interrupts(uint32_t mask)
 
 uint8_t TimeSync_Init(void)
 {
-    if (htim2.Instance != TIM2 || htim2.Init.Prescaler != 20u ||
-        HAL_RCC_GetPCLK1Freq() != 42000000u ||
-        (RCC->CFGR & RCC_CFGR_TIMPRE) != 0u)
+    RCC_ClkInitTypeDef clocks;
+    uint32_t flash_latency;
+    HAL_RCC_GetClockConfig(&clocks, &flash_latency);
+    const uint64_t pclk = HAL_RCC_GetPCLK1Freq();
+    uint64_t timer_clock;
+    /* RM0433: TIMPRE=0 selects PCLK at /1, otherwise 2*PCLK.
+     * TIMPRE=1 selects HCLK at /1,/2,/4, otherwise 4*PCLK. */
+    if ((RCC->CFGR & RCC_CFGR_TIMPRE) == 0u)
+        timer_clock = clocks.APB1CLKDivider == RCC_APB1_DIV1 ? pclk : 2u * pclk;
+    else
+        timer_clock = (clocks.APB1CLKDivider == RCC_APB1_DIV1 ||
+                       clocks.APB1CLKDivider == RCC_APB1_DIV2 ||
+                       clocks.APB1CLKDivider == RCC_APB1_DIV4) ?
+                       HAL_RCC_GetHCLKFreq() : 4u * pclk;
+
+    if (htim2.Instance != TIM2 || htim2.Init.Prescaler > 0xffffu ||
+        htim2.Init.Period != UINT32_MAX ||
+        htim2.Init.CounterMode != TIM_COUNTERMODE_UP ||
+        TIM2->PSC != htim2.Init.Prescaler || TIM2->ARR != UINT32_MAX ||
+        (TIM2->CR1 & (TIM_CR1_DIR | TIM_CR1_CMS)) != 0u ||
+        timer_clock != (uint64_t)TIMER_HZ * (htim2.Init.Prescaler + 1u))
     {
         return 0u;
     }
@@ -256,8 +277,8 @@ uint8_t TimeSync_BindGpsSecond(uint16_t week, uint32_t tow_ms,
                               g_recent_pps.ticks, g_recent_pps.period_ticks};
     /* A 300 ms gate rejects a 500 ms pulse's trailing edge.  This remains
      * conditional until the UM982 PPS polarity and GPS time reference are checked. */
-    if (pps.sequence == 0u || pps.period_ticks < 3500000u ||
-        pps.period_ticks > 4500000u || observed_ticks < pps.ticks ||
+    if (pps.sequence == 0u || pps.period_ticks < MIN_PPS_PERIOD_TICKS ||
+        pps.period_ticks > MAX_PPS_PERIOD_TICKS || observed_ticks < pps.ticks ||
         observed_ticks - pps.ticks > pps.period_ticks * 3u / 10u)
     {
         unlock_interrupts(mask);

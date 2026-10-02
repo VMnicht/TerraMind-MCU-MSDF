@@ -49,6 +49,17 @@ bool MonitorUart6Dma::enqueue(const char *record, size_t length)
     return true;
 }
 
+void MonitorUart6Dma::stop()
+{
+    if (uart_ == NULL) return;
+    // Application-task owner; HAL abort stops any in-flight DMA before reconfiguration.
+    HAL_UART_AbortTransmit(uart_);
+    bytes_discarded_ += static_cast<uint16_t>((head_-tail_)&QUEUE_MASK);
+    head_=tail_=active_length_=0;
+    busy_=failed_=false;
+    uart_=NULL;
+}
+
 void MonitorUart6Dma::start_next_dma()
 {
     if (uart_ == NULL || busy_ || failed_ || tail_ == head_) return;
