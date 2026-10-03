@@ -5,6 +5,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from startup_calibration import parse_calibration, read_calibration
 from monitor_protocol import MonitorModel
+from monitor_gui import corrected_delta_text
 from capture_profile import RawCapture, CaptureProfile, load_capture
 from kf_gins_bridge import KfOptions, prepare_log
 from test_kf_gins_bridge import example_log
@@ -61,6 +62,45 @@ class StartupCalibrationTests(unittest.TestCase):
                 output.write((B.replace(",1000000,", ",1000001,")+"\n").encode())
             with self.assertRaisesRegex(ValueError, "不同启动标定"):
                 read_calibration(path)
+
+    def test_display_keeps_complete_pair_between_serial_chunks(self):
+        model = MonitorModel()
+        profile = CaptureProfile(delta_ctrl=0xCC)
+        model.feed(B, 3.005)
+        model.feed("I,3010,3,100,0,0,0,1,2,3,4,5,6", 3.010)
+        model.feed("T,3010,100,1,0,12040000,0,12046000", 3.010)
+        model.feed("I,3015,3,413,0,0,0,1,2,3,4,5,6", 3.015)
+        model.feed("T,3015,413,2,0,12060000,0,12066000", 3.015)
+        displayed = corrected_delta_text(model, profile, 3.015)
+        self.assertIn("最近完整帧", displayed)
+        # Force a GUI refresh after I, before its T, with very different data.
+        model.feed("I,3020,3,725,0,0,0,1000000,2000000,3000000,4,5,6", 3.020)
+        self.assertIsNone(model.imu_dt_s)
+        self.assertEqual(corrected_delta_text(model, profile, 3.020), displayed)
+        self.assertEqual(model.imu_display_pair[0].count, 413)
+        model.feed("T,3020,725,3,0,12080000,0,12086000", 3.021)
+        self.assertEqual(model.imu_display_pair[0].count, 725)
+        self.assertNotEqual(corrected_delta_text(model, profile, 3.021), displayed)
+        self.assertIn("已过期", corrected_delta_text(model, profile, 3.222))
+        self.assertIn("不匹配", corrected_delta_text(model, CaptureProfile(), 3.021))
+        model.feed(B.replace("1000000,-2000000", "1000001,-2000000"), 3.022)
+        self.assertIsNone(model.imu_display_pair)
+
+    def test_display_does_not_hide_timing_failure(self):
+        model = MonitorModel()
+        profile = CaptureProfile(delta_ctrl=0xCC)
+        model.feed(B, 3.005)
+        for index in range(2):
+            ms, count, tick = 3010+5*index, 100+313*index, 12040000+20000*index
+            model.feed(f"I,{ms},3,{count},0,0,0,1,2,3,4,5,6", ms/1000)
+            model.feed(f"T,{ms},{count},{index+1},0,{tick},0,0", ms/1000)
+        self.assertIsNotNone(model.imu_display_pair)
+        model.feed("I,3020,3,725,0,0,0,1,2,3,4,5,6", 3.020)
+        model.feed("T,3020,725,0,0,0,0,12086000", 3.020)
+        self.assertIsNone(model.imu_display_pair)
+        self.assertEqual(model.imu_timed_missing, 1)
+        self.assertIn("去静止均值 Δθ °: — 等待有效 I/T 配对",
+                      corrected_delta_text(model, profile, 3.020))
 
 
 if __name__ == "__main__": unittest.main()

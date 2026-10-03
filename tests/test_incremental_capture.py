@@ -104,13 +104,13 @@ class IncrementalCaptureTests(unittest.TestCase):
             path = Path(temp) / "log.txt"
             example_log(path)
             raw = path.read_bytes()
-            legacy = prepare_log(path, KfOptions(delta_ctrl=0xCC))
+            legacy = prepare_log(path, KfOptions(delta_ctrl=0xCC, apply_startup_calibration=False))
             capture = RawCapture(path, CaptureProfile(delta_ctrl=0xCD, delta_ctrl_confirmed=True))
             capture.write(raw)
             capture.close()
             with self.assertRaisesRegex(ValueError, "冲突"):
                 prepare_log(path, KfOptions())
-            checked = prepare_log(path, KfOptions(delta_ctrl=0xCD))
+            checked = prepare_log(path, KfOptions(delta_ctrl=0xCD, apply_startup_calibration=False))
             self.assertEqual(checked.imu_rows[0][6], 2 * legacy.imu_rows[0][6])
             self.assertEqual(path.read_bytes(), raw)
             metadata = json.loads(sidecar_path(path).read_text(encoding="utf-8"))

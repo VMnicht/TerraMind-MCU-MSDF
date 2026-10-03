@@ -20,6 +20,34 @@ struct Context {
 static uint32_t fakeClock(void *user) {
     auto &ticks=*static_cast<uint32_t *>(user);ticks+=100;return ticks;
 }
+static void defaultConfigTests() {
+    NavConfig cfg{};Nav_DefaultConfig(&cfg);
+    Context c;auto seed=fixture::imu(0);
+    CHECK(Nav_Initialize(c.ptr,&cfg,&seed)==NAV_OK);
+    double covariance[NAV_STATE_DIM*NAV_STATE_DIM];
+    CHECK(Nav_GetCovariance(c.ptr,covariance));
+    for(unsigned i=0;i<3;++i) {
+        // Check the unit boundary and the actual filter P0, not only the config:
+        // 10000 mGal -> 0.1 m/s^2; 2/2/3 degrees -> radians before squaring.
+        const double attitude_std=(i==2?3.0:2.0)*fixture::pi/180;
+        CHECK(std::abs(covariance[(6+i)*NAV_STATE_DIM+6+i]-attitude_std*attitude_std)<1e-14);
+        CHECK(std::abs(covariance[(12+i)*NAV_STATE_DIM+12+i]-0.01)<1e-14);
+        CHECK(std::abs(cfg.accel_vrw[i]-0.5/60)<1e-14);
+        CHECK(std::abs(cfg.accel_bias_std[i]-0.0025)<1e-14);
+        CHECK(cfg.initial.accel_bias[i]==0); // Do not hardcode fitted log biases.
+        CHECK(cfg.antenna_lever_frd_m[i]==0); // Installation remains explicit.
+    }
+    CHECK(cfg.output_hz==100 && cfg.buffer_delay_s==0.2 && cfg.correlation_time_s==3600);
+    // With the default delay/rate, retain every IMU update and publish once per
+    // 10 ms. No heading or Doppler observations exist on the board API.
+    auto sample=fixture::imu(1);uint32_t count=0;
+    CHECK(Nav_PushImu(c.ptr,&sample)==NAV_OK);
+    CHECK(Nav_Process(c.ptr,sample.time_s+cfg.buffer_delay_s,1,&count)==NAV_OK && count==1);
+    NavOutput out{};CHECK(Nav_PollOutput(c.ptr,sample.time_s+cfg.buffer_delay_s,&out));
+    NavStats stats{};Nav_GetStats(c.ptr,&stats);
+    CHECK(stats.gnss_updates==0 && stats.imu_processed==1 && stats.issue_flags==0);
+    std::cout<<"vehicle defaults: SI units, initial covariance and separate bias process noise passed\n";
+}
 static void compare(const fixture::Inputs &data,const std::string &path) {
     Context c;CHECK(Nav_Initialize(c.ptr,&data.cfg,&data.imu.front())==NAV_OK);
     std::ifstream in(path,std::ios::binary);CHECK(in.good());
@@ -189,6 +217,6 @@ int main(int argc,char **argv) {
         CHECK(argc==3);std::cout<<"context bytes="<<Nav_ContextSize()<<", alignment="<<Nav_ContextAlignment()<<"\n";
         compare(fixture::synthetic(),std::string(argv[1])+"/synthetic.bin");
         compare(fixture::dataset(argv[2]),std::string(argv[1])+"/dataset.bin");
-        runtimeTests();adapters();return 0;
+        defaultConfigTests();runtimeTests();adapters();return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

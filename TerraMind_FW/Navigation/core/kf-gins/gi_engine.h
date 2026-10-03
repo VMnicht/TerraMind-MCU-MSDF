@@ -46,6 +46,9 @@ public:
         imu2.dt -= mid.dt;
     }
 private:
+    // Offline-only observation experiments reuse this full 21-state engine.
+    // The friend has no definition in firmware targets and adds no state/code there.
+    friend class OfflineAiding;
     void initialize(const NavState &, const NavState &);
     void imuCompensate(IMU &);
     int isToUpdate(double, double, double) const;

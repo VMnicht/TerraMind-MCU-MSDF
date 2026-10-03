@@ -63,6 +63,9 @@ size_t Nav_ContextSize(void);
 size_t Nav_ContextAlignment(void);
 NavContext *Nav_Construct(void *aligned_memory, size_t bytes);
 void Nav_Destroy(NavContext *context);
+// G365 vehicle noise / initial-uncertainty profile in SI units. Continual GNSS
+// updates remain position-only; no heading / Doppler update is enabled here.
+// Initial navigation state and installation geometry still require the caller.
 void Nav_DefaultConfig(NavConfig *config);
 // Initial state must correspond to seed.time_s; seed is the preceding complete
 // IMU interval. Both streams and all clock arguments use the SAME continuous

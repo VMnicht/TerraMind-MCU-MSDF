@@ -124,10 +124,16 @@ extern "C" void Nav_DefaultConfig(NavConfig *c) {
     for(unsigned i=0;i<3;++i) {
         c->initial_std.position[i]=i==2?0.2:0.1;
         c->initial_std.velocity[i]=0.05;
-        c->initial_std.attitude[i]=(i==2?1.0:0.5)*pi/180;
-        c->gyro_arw[i]=0.24*pi/180/60; c->accel_vrw[i]=0.24/60;
+        // Same priors / noise as tools/config/kf_gins_g365_vehicle.yaml,
+        // converted from degrees / hours to the public API's SI units.
+        c->initial_std.attitude[i]=(i==2?3.0:2.0)*pi/180;
+        c->gyro_arw[i]=0.24*pi/180/60; c->accel_vrw[i]=0.5/60;
         c->gyro_bias_std[i]=c->initial_std.gyro_bias[i]=50*pi/180/3600;
-        c->accel_bias_std[i]=c->initial_std.accel_bias[i]=250e-5;
+        // Startup calibration removes gyro bias only. Allow accel bias to
+        // converge from an uncertain initial value without increasing its
+        // Gauss-Markov process noise (250 mGal) after initialization.
+        c->initial_std.accel_bias[i]=10000e-5;
+        c->accel_bias_std[i]=250e-5;
         c->gyro_scale_std[i]=c->initial_std.gyro_scale[i]=1000e-6;
         c->accel_scale_std[i]=c->initial_std.accel_scale[i]=1000e-6;
     }

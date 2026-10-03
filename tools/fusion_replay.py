@@ -6,14 +6,16 @@ import argparse
 from bisect import bisect_right
 from dataclasses import asdict
 import json
-from math import ceil, cos, floor, hypot, log10, radians, sin
+from math import ceil, cos, degrees, floor, hypot, log10, radians, sin
 from pathlib import Path
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Optional
 
-from fusion2d import FusionResult, Geometry, run_fusion
+from fusion2d import FusionResult, Geometry, ImuInputOptions, run_fusion
+from capture_profile import load_capture
+from startup_calibration import load_startup_calibration
 
 
 LABELS = (
@@ -30,14 +32,20 @@ class ReplayApp:
     def __init__(self, root: tk.Tk, initial_log: Optional[Path] = None) -> None:
         self.root = root
         root.title("TerraMind 二维组合导航离线回放")
-        root.geometry("1160x850")
+        root.geometry("1160x900")
         root.minsize(880, 680)
         self.log_path = tk.StringVar(value=str(initial_log) if initial_log else "")
+        # Same vehicle as the KF-GINS GUI, expressed in sensor X/Y coordinates.
+        defaults = Geometry(lever_x_m=0.15, lever_y_m=0.0, heading_offset_deg=180.0,
+                            gyro_heading_sign=1, imu_y_right_sign=1, gnss_delay_ms=0.0)
         self.fields: Dict[str, tk.StringVar] = {
-            key: tk.StringVar(value=str(value)) for key, value in asdict(Geometry()).items()
+            key: tk.StringVar(value=str(value)) for key, value in asdict(defaults).items()
         }
         self.speed = tk.StringVar(value="1×")
         self.calibrate_static_imu = tk.BooleanVar(value=False)
+        self.delta_ctrl = tk.StringVar(value="")
+        self.apply_delta_startup = tk.BooleanVar(value=True)
+        self.imu_input_text = tk.StringVar(value="自动识别模式 2 / 3；模式 3 的 DLT_CTRL 优先读取 B / 配套 JSON。")
         self.calibration_text = tk.StringVar(value="前 3 秒静止零位标定：关闭")
         self.status = tk.StringVar(value="选择 USART6 日志，填写安装几何，然后点击“运行融合”。")
         self.rate_text = tk.StringVar()
@@ -60,6 +68,10 @@ class ReplayApp:
         self.point_detail = tk.StringVar(value="滚轮缩放 · 左键拖动平移 · 悬停蓝点查看融合位置")
         self._slider_internal = False
         self._build()
+        # KF-GINS hides this panel and keeps its own input configuration loader.
+        if self.imu_input_frame.winfo_manager():
+            self.log_path.trace_add("write", lambda *_: self._load_imu_profile())
+            self._load_imu_profile()
         root.after(40, self._tick)
         if initial_log is not None:
             root.after(150, self._run)
@@ -89,8 +101,19 @@ class ReplayApp:
         ttk.Button(geom_buttons, text="导入安装配置", command=self._load_geometry).pack(side="left")
         ttk.Button(geom_buttons, text="保存安装配置", command=self._save_geometry).pack(side="left", padx=8)
         ttk.Button(geom_buttons, text="导出融合 CSV", command=self._export_csv).pack(side="left", padx=8)
-        ttk.Label(geom_buttons, text="默认 0 杆臂仅用于演示；请填入实际测量值。",
+        ttk.Label(geom_buttons, text="已填车辆默认安装；航向沿 IMU +X，可按实测修改。",
                   foreground="#92400e").pack(side="right")
+
+        self.imu_input_frame = ttk.LabelFrame(main, text="IMU 输入（自动识别模式；以下设置仅作用于模式 3）", padding=6)
+        self.imu_input_frame.pack(fill="x", pady=(7, 0))
+        input_row = ttk.Frame(self.imu_input_frame)
+        input_row.pack(fill="x")
+        ttk.Label(input_row, text="DLT_CTRL（空白自动读取）").pack(side="left")
+        ttk.Entry(input_row, textvariable=self.delta_ctrl, width=10).pack(side="left", padx=6)
+        ttk.Checkbutton(input_row, text="模式3：应用板端启动标定（B/JSON）",
+                        variable=self.apply_delta_startup).pack(side="left", padx=8)
+        ttk.Label(self.imu_input_frame, textvariable=self.imu_input_text, wraplength=1080,
+                  foreground="#1F4E79").pack(anchor="w")
 
         calibration_row = ttk.Frame(main)
         self.calibration_row = calibration_row
@@ -131,7 +154,10 @@ class ReplayApp:
                             ("● 杆臂修正观测", "#16a34a"),
                             ("━ ● 融合轨迹与位置点", "#2563eb"),
                             ("➤ 当前航向", "#ea580c")):
-            ttk.Label(legend, text=text, foreground=color).pack(side="left", padx=(0, 16))
+            label = ttk.Label(legend, text=text, foreground=color)
+            label.pack(side="left", padx=(0, 16))
+            if color == "#2563eb":
+                self.fused_legend = label
         ttk.Button(legend, text="重置视图", command=self._reset_view).pack(side="right")
         ttk.Label(main, textvariable=self.point_detail, foreground="#334155").pack(anchor="w")
 
@@ -147,7 +173,7 @@ class ReplayApp:
         self.time_label = ttk.Label(controls, text="0.0 / 0.0 s", width=15)
         self.time_label.pack(side="right")
         ttk.Label(main, textvariable=self.metrics, font=("Consolas", 10)).pack(anchor="w", pady=(6, 0))
-        self.model_note = ttk.Label(main, text="实验性二维松组合：IMU 200 Hz 预测，UM982 10 Hz 位置 / 多普勒速度 / 双天线航向更新。"
+        self.model_note = ttk.Label(main, text="实验性二维松组合：支持模式 2 / 3 IMU，200 Hz 预测，UM982 10 Hz 位置 / 多普勒速度 / 双天线航向更新。"
                                     "未补偿横滚俯仰重力投影；PPS 的 GPS 整秒归属仍需核验，轨迹不能视为真值。",
                                     foreground="#6b7280", wraplength=1100)
         self.model_note.pack(anchor="w", pady=(3, 0))
@@ -170,29 +196,76 @@ class ReplayApp:
         except ValueError as exc:
             raise ValueError(f"安装参数无效：{exc}") from exc
 
+    def _imu_options(self) -> ImuInputOptions:
+        raw = self.delta_ctrl.get().strip()
+        options = ImuInputOptions(int(raw, 0) if raw else None, self.apply_delta_startup.get())
+        options.validate()
+        return options
+
+    def _load_imu_profile(self) -> None:
+        path = Path(self.log_path.get())
+        if not path.is_file():
+            self.imu_input_text.set("自动识别模式 2 / 3；模式 3 的 DLT_CTRL 优先读取 B / 配套 JSON。")
+            return
+        try:
+            mode = None
+            with path.open("r", encoding="ascii", errors="replace") as source:
+                for line in source:
+                    if line.startswith("I,"):
+                        fields = line.strip().split(",")
+                        if len(fields) == 13:
+                            mode = int(fields[2])
+                            break
+            if mode == 2:
+                self.imu_input_text.set("检测到模式 2 原始角速度 / 加速度：保持原处理流程；本框的模式 3 设置不生效。")
+                return
+            if mode != 3:
+                self.imu_input_text.set("尚未找到可识别的 IMU 帧，运行时将校验完整日志。")
+                return
+            metadata = load_capture(path, verify_log=True)
+            startup = load_startup_calibration(path, metadata)
+            ctrl = startup.delta_ctrl if startup else metadata["profile"]["delta_ctrl"] if metadata else None
+            scale = f"记录 DLT_CTRL=0x{ctrl:04X}" if ctrl is not None else "缺少比例记录，需手填 DLT_CTRL"
+            calibration = (f"板端标定 {startup.samples} 帧 / {startup.duration_us/1e6:.3f} s"
+                           if startup else "无 B/JSON 标定，旧日志须明确取消板端标定选项")
+            self.imu_input_text.set(f"检测到模式 3 角增量 / 速度增量；{scale}；{calibration}。")
+        except (OSError, ValueError) as exc:
+            self.imu_input_text.set(f"IMU 输入记录错误：{exc}")
+
     def _load_geometry(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("JSON 配置", "*.json")])
         if not path:
             return
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
+            imu_options = ImuInputOptions(**data.pop("imu_input", {}))
+            imu_options.validate()
+            static = data.pop("calibrate_static_imu", False)
+            if type(static) is not bool:
+                raise ValueError("额外静止标定开关必须为布尔值")
             geometry = Geometry(**data)
             geometry.validate()
             for key, value in asdict(geometry).items():
                 self.fields[key].set(str(value))
+            self.delta_ctrl.set("" if imu_options.delta_ctrl is None else f"0x{imu_options.delta_ctrl:04X}")
+            self.apply_delta_startup.set(imu_options.apply_startup_calibration)
+            self.calibrate_static_imu.set(static)
         except (OSError, ValueError, TypeError) as exc:
             messagebox.showerror("导入失败", str(exc))
 
     def _save_geometry(self) -> None:
         try:
             geometry = self._geometry()
+            imu_options = self._imu_options()
         except ValueError as exc:
             messagebox.showerror("配置错误", str(exc))
             return
         path = filedialog.asksaveasfilename(defaultextension=".json", initialfile="installation_geometry.json",
                                              filetypes=[("JSON 配置", "*.json")])
         if path:
-            Path(path).write_text(json.dumps(asdict(geometry), ensure_ascii=False, indent=2) + "\n",
+            saved = dict(asdict(geometry), imu_input=asdict(imu_options),
+                         calibrate_static_imu=self.calibrate_static_imu.get())
+            Path(path).write_text(json.dumps(saved, ensure_ascii=False, indent=2) + "\n",
                                   encoding="utf-8")
 
     def _run(self) -> None:
@@ -210,11 +283,7 @@ class ReplayApp:
         finally:
             self.root.configure(cursor="")
         self.result = result
-        xs = [g.antenna_e_m for g in result.gnss] + [f.east_m for f in result.frames]
-        ys = [g.antenna_n_m for g in result.gnss] + [f.north_m for f in result.frames]
-        self.fit_center_e_m = (min(xs) + max(xs)) / 2
-        self.fit_center_n_m = (min(ys) + max(ys)) / 2
-        self.fit_span_m = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) * 1.18
+        self._fit_result()
         self.frame_times = [f.mcu_ms for f in result.frames]
         self.current_index = 0
         self.target_mcu_ms = self.frame_times[0]
@@ -255,7 +324,18 @@ class ReplayApp:
         else:
             self.calibration_text.set(
                 f"前 3 秒静止零位标定：未应用（{calibration.reason}）；"
-                "本次使用未预先扣零的 IMU 数据")
+                "本次未额外扣除此段均值")
+        if getattr(result, "imu_input_mode", 2) == 3:
+            startup = result.board_startup_calibration
+            if startup:
+                mean = " / ".join(f"{degrees(v):+.6f}" for v in startup.stationary_rate)
+                self.imu_input_text.set(f"本次：模式 3，DLT_CTRL=0x{result.delta_ctrl:04X}；"
+                                        f"已扣板端 XYZ 静止均值 {mean} °/s；原日志保持不变。")
+                if calibration:
+                    self.calibration_text.set(self.calibration_text.get().replace(
+                        "前 3 秒静止零位标定", "前 3 秒额外标定（板端补偿后）"))
+            else:
+                self.imu_input_text.set(f"本次：模式 3，DLT_CTRL=0x{result.delta_ctrl:04X}；未应用板端启动标定。")
         notes = list(result.warnings)
         if self._zero_geometry(geometry):
             notes.insert(0, "当前为零杆臂/零偏角演示；填写实测安装值后重新运行")
@@ -264,7 +344,21 @@ class ReplayApp:
 
     def _compute(self, path: Path, geometry: Geometry) -> FusionResult:
         return run_fusion(path, geometry,
-                          calibrate_static_imu=self.calibrate_static_imu.get())
+                          calibrate_static_imu=self.calibrate_static_imu.get(), imu_options=self._imu_options())
+
+    def _frame_position(self, frame) -> tuple[float, float]:
+        """Display hook; the 2-D tool continues to use its original IMU coordinates."""
+        return frame.east_m, frame.north_m
+
+    def _fit_result(self) -> None:
+        if self.result is None:
+            return
+        points = [(g.antenna_e_m, g.antenna_n_m) for g in self.result.gnss]
+        points += [self._frame_position(f) for f in self.result.frames]
+        xs, ys = zip(*points)
+        self.fit_center_e_m = (min(xs) + max(xs)) / 2
+        self.fit_center_n_m = (min(ys) + max(ys)) / 2
+        self.fit_span_m = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) * 1.18
 
     def _zero_geometry(self, geometry: Geometry) -> bool:
         return geometry.lever_x_m == geometry.lever_y_m == geometry.heading_offset_deg == 0
@@ -375,9 +469,10 @@ class ReplayApp:
             self.point_detail.set("滚轮缩放 · 左键拖动平移 · 悬停蓝点查看融合位置")
             return
         frame = self.result.frames[near[2]]
+        east, north = self._frame_position(frame)
         elapsed = (frame.mcu_ms - self.result.frames[0].mcu_ms) / 1000
         self.point_detail.set(f"融合点 #{near[2] + 1}  t={elapsed:.3f} s  "
-                              f"E={frame.east_m:+.3f} m  N={frame.north_m:+.3f} m  "
+                              f"E={east:+.3f} m  N={north:+.3f} m  "
                               f"速度={hypot(frame.ve_mps, frame.vn_mps):.3f} m/s")
 
     def _view_scale(self) -> float:
@@ -444,7 +539,7 @@ class ReplayApp:
                     canvas.create_oval(qx - 2, qy - 2, qx + 2, qy + 2, fill="#16a34a", outline="")
         visible_indices = []
         for i, frame in enumerate(fused[:self.current_index + 1]):
-            fx, fy = xy(frame.east_m, frame.north_m)
+            fx, fy = xy(*self._frame_position(frame))
             if -5 <= fx <= width + 5 and -5 <= fy <= height + 5:
                 visible_indices.append((i, fx, fy))
         # Keep line detail in the zoomed region without creating thousands of canvas objects.
@@ -455,7 +550,7 @@ class ReplayApp:
         line_indices.add(self.current_index)
         path = []
         for i in sorted(line_indices):
-            path.extend(xy(fused[i].east_m, fused[i].north_m))
+            path.extend(xy(*self._frame_position(fused[i])))
         if len(path) >= 4:
             canvas.create_line(*path, fill="#2563eb", width=2.5, smooth=False)
         self.visible_fused_points = []
@@ -464,7 +559,8 @@ class ReplayApp:
                                fill="#2563eb", outline="#ffffff", width=0.7)
             self.visible_fused_points.append((fx, fy, i))
         frame = fused[self.current_index]
-        px, py = xy(frame.east_m, frame.north_m)
+        east, north = self._frame_position(frame)
+        px, py = xy(east, north)
         canvas.create_oval(px - 6, py - 6, px + 6, py + 6, fill="#ea580c", outline="white", width=2)
         angle = radians(frame.heading_deg)
         canvas.create_line(px, py, px + 25 * sin(angle), py - 25 * cos(angle),
@@ -472,7 +568,7 @@ class ReplayApp:
         elapsed = (frame.mcu_ms - fused[0].mcu_ms) / 1000
         total = (fused[-1].mcu_ms - fused[0].mcu_ms) / 1000
         self.time_label.configure(text=f"{elapsed:.1f} / {total:.1f} s")
-        self.metrics.set(f"当前 E={frame.east_m:+.3f} m   N={frame.north_m:+.3f} m   "
+        self.metrics.set(f"当前 E={east:+.3f} m   N={north:+.3f} m   "
                          f"速度={hypot(frame.ve_mps, frame.vn_mps):.3f} m/s   "
                          f"航向={frame.heading_deg:.2f}°   "
                          f"原点=({self.result.origin_lat_deg:.8f}°, {self.result.origin_lon_deg:.8f}°)")

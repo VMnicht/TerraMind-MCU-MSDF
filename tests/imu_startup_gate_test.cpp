@@ -60,7 +60,7 @@ static void sample() {
 }
 int main() {
     huart6.hdmatx=&huart6;assert(App_ImuInit());assert(!Monitor_Init());
-    assert(App_ImuGetDeltaCtrl()==0x0008);
+    assert(App_ImuGetDeltaCtrl()==0x0048);
     for(unsigned i=0;i<600;++i) {sample();assert(output.empty());assert(edges==0);}
     assert(!App_ImuCalibrationReady());
     sample();assert(App_ImuCalibrationReady());

@@ -136,6 +136,9 @@ class MonitorModel:
         self.imu_sensor_fault_at = -1e9
         self.calibration = None
         self.imu_dt_s = None
+        # Publish a complete I/T pair for display; a following I may arrive in
+        # a different serial chunk from its T. Never reuse its dt on the new I.
+        self.imu_display_pair: Optional[Tuple[Imu, float, float]] = None
         self.last_drdy = None
         self.counts: Counter[str] = Counter()
 
@@ -150,6 +153,7 @@ class MonitorModel:
                 calibration = parse_calibration(line)
                 if self.calibration and self.calibration.identity() != calibration.identity():
                     self.local_fault_at = at
+                    self.imu_display_pair = None
                 self.calibration = calibration
                 self.counts["B"] += 1
             elif line.startswith("I,"):
@@ -163,12 +167,16 @@ class MonitorModel:
                 self.observed_modes.add(sample.mode)
                 if sample.flag & 0x0101:
                     self.imu_sensor_fault_at = at
+                    self.imu_display_pair = None
                 if self.imu is not None:
+                    if sample.mode != self.imu.mode:
+                        self.imu_display_pair = None
                     delta_ms = sample.mcu_ms - self.imu.mcu_ms
                     delta_count = (sample.count - self.imu.count) & 0xFFFF
                     if delta_ms > 8 or delta_ms <= 0 or delta_count not in (312, 313):
                         self.imu_count_gaps += 1
                         self.local_fault_at = at
+                        self.imu_display_pair = None
                 self.imu = sample
                 self.imu_dt_s = None
                 self.imu_at = at
@@ -247,6 +255,8 @@ class MonitorModel:
                     self.local_fault_at = at
                 self.counts["P"] += 1
             elif line.startswith("T,"):
+                self.imu_dt_s = None
+                self.imu_display_pair = None
                 values = [int(x) for x in line.split(",")[1:]]
                 if len(values) != 7:
                     raise ValueError("IMU timing record")
@@ -261,6 +271,8 @@ class MonitorModel:
                             self.imu and (values[0], values[1]) == (self.imu.mcu_ms, self.imu.count)):
                         dt = (ticks - self.last_drdy[1]) / 4_000_000
                         self.imu_dt_s = dt if 0.004 <= dt <= 0.006 else None
+                        if self.imu_dt_s is not None and not self.imu.flag & 0x0101:
+                            self.imu_display_pair = (self.imu, self.imu_dt_s, at)
                     self.last_drdy = (values[2], ticks)
                 self.counts["T"] += 1
             elif line.startswith("R,"):
@@ -292,6 +304,10 @@ class MonitorModel:
                 self.unknown_lines += 1
                 self.local_fault_at = at
         except (ValueError, IndexError, UnicodeError):
+            if line.startswith(("I,", "T,")):
+                self.imu_dt_s = None
+                self.imu_display_pair = None
+                self.last_drdy = None
             self.record_errors += 1
             self.local_fault_at = at
         self._trim(at)

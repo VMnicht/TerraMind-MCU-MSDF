@@ -6,9 +6,9 @@ absolute hardware synchronization, so its output is not ground truth.
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass
-from math import cos, hypot, pi, radians, sin, sqrt
+from math import cos, degrees, hypot, pi, radians, sin, sqrt
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -16,6 +16,8 @@ import numpy as np
 
 from monitor_protocol import unicore_crc32
 from sync_timeline import MAX_GNSS_OUTPUT_LATENCY_MS, analyze_sync
+from capture_profile import delta_scales, load_capture
+from startup_calibration import StartupCalibration, load_startup_calibration
 
 
 @dataclass
@@ -54,6 +56,24 @@ class ImuObs:
     accel_x_mps2: float
     accel_y_mps2: float
     capture_ticks: Optional[int] = None
+    mode: int = 2
+    angle_raw: Optional[Tuple[int, int, int]] = None
+    velocity_raw: Optional[Tuple[int, int, int]] = None
+    drdy_sequence: int = 0
+
+
+@dataclass
+class ImuInputOptions:
+    # Mode 3 only. None reads the B record / capture JSON instead of guessing.
+    delta_ctrl: Optional[int] = None
+    apply_startup_calibration: bool = True
+
+    def validate(self) -> None:
+        if self.delta_ctrl is not None and (type(self.delta_ctrl) is not int or
+                                            not 0 <= self.delta_ctrl <= 0xFFFF):
+            raise ValueError("DLT_CTRL 必须为空（自动读取）或 0x0000–0xFFFF")
+        if type(self.apply_startup_calibration) is not bool:
+            raise ValueError("应用板端启动标定必须为布尔值")
 
 
 @dataclass
@@ -142,6 +162,13 @@ class FusionResult:
     static_calibration: Optional[StaticImuCalibration] = None
 
 
+@dataclass
+class PlanarFusionResult(FusionResult):
+    imu_input_mode: int = 2
+    delta_ctrl: Optional[int] = None
+    board_startup_calibration: Optional[StartupCalibration] = None
+
+
 def _wrap_rad(angle: float) -> float:
     return (angle + pi) % (2 * pi) - pi
 
@@ -151,33 +178,46 @@ def _lever_en(heading_rad: float, geometry: Geometry) -> Tuple[float, float]:
     return x * sin(heading_rad) + y * cos(heading_rad), x * cos(heading_rad) - y * sin(heading_rad)
 
 
-def _parse_log(path: Path) -> Tuple[List[ImuObs], List[PosObs], List[HeadingObs], int]:
+def _parse_log(path: Path, input_warnings: Optional[List[str]] = None) -> Tuple[List[ImuObs], List[PosObs], List[HeadingObs], int]:
     imu: List[ImuObs] = []
     positions: List[PosObs] = []
     headings: List[HeadingObs] = []
     rejected = 0
     with path.open("r", encoding="ascii", errors="replace") as source:
         for line in source:
+            terminated = line.endswith(("\r", "\n"))
             line = line.strip()
             try:
                 if line.startswith("I,"):
                     f = line.split(",")
-                    if len(f) != 13 or f[2] != "2":
-                        raise ValueError("only raw mode 2 is supported")
-                    imu.append(ImuObs(
-                        int(f[1]), int(f[3]),
-                        int(f[7]) / (66 * 65536),
-                        int(f[8]) / (66 * 65536),
-                        int(f[9]) / (66 * 65536),
-                        int(f[10]) * 9.80665 / (2500 * 65536),
-                        int(f[11]) * 9.80665 / (2500 * 65536),
-                    ))
+                    if len(f) != 13 or f[2] not in ("2", "3"):
+                        raise ValueError("IMU 字段或模式错误（仅支持模式 2 / 3）")
+                    if f[2] == "2":
+                        imu.append(ImuObs(
+                            int(f[1]), int(f[3]),
+                            int(f[7]) / (66 * 65536),
+                            int(f[8]) / (66 * 65536),
+                            int(f[9]) / (66 * 65536),
+                            int(f[10]) * 9.80665 / (2500 * 65536),
+                            int(f[11]) * 9.80665 / (2500 * 65536),
+                        ))
+                    else:
+                        values = tuple(int(v) for v in f[7:13])
+                        flag, count = int(f[4]), int(f[3])
+                        if (not 0 <= count <= 65535 or not 0 <= flag <= 65535 or
+                                any(not -(2**31) <= v < 2**31 for v in values)):
+                            raise ValueError("模式 3 原始数值超出范围")
+                        if flag & 0x0101 or any(v in (-(2**31), 2**31-1) for v in values):
+                            raise ValueError("模式 3 增量满量程或 FLAG 错误；截顶数据不能恢复")
+                        imu.append(ImuObs(int(f[1]), count, 0., 0., 0., 0., 0.,
+                                          mode=3, angle_raw=values[:3], velocity_raw=values[3:]))
                 elif line.startswith("T,"):
                     f = line.split(",")
                     if len(f) != 8:
                         raise ValueError("IMU timing fields")
                     if imu and imu[-1].mcu_ms == int(f[1]) and imu[-1].count == int(f[2]) and int(f[3]) != 0:
                         imu[-1].capture_ticks = (int(f[4]) << 32) | int(f[5])
+                        imu[-1].drdy_sequence = int(f[3])
                 elif line.startswith("N,"):
                     _, mcu_text, raw = line.split(",", 2)
                     if not raw.startswith(("#BESTNAVA,", "#UNIHEADINGA,")):
@@ -212,9 +252,79 @@ def _parse_log(path: Path) -> Tuple[List[ImuObs], List[PosObs], List[HeadingObs]
                             int(mcu_text), gps_ms, body[0], body[1],
                             float(body[3]), float(body[6]), float(body[2]),
                         ))
-            except (ValueError, IndexError, UnicodeError):
+            except (ValueError, IndexError, UnicodeError) as exc:
+                fields = line.split(",")
+                truncated_tail = (not terminated and
+                                  ((line.startswith("I,") and len(fields) < 13) or
+                                   (line.startswith("T,") and len(fields) < 8)))
+                if truncated_tail:
+                    rejected += 1
+                    if input_warnings is not None:
+                        input_warnings.append("已忽略采集结束时被截断的不完整 IMU 末行，只回放此前完整帧")
+                    continue
+                if ((line.startswith("I,") and len(fields) > 2 and fields[2] == "3") or
+                        (line.startswith(("I,", "T,")) and imu and imu[-1].mode == 3)):
+                    raise ValueError(f"增量 IMU 记录无效，不能静默跳过：{exc}") from exc
                 rejected += 1
     return imu, positions, headings, rejected
+
+
+def incremental_settings(path: Path, options: ImuInputOptions):
+    """Resolve mode-3 units and board mean; never edit source data or metadata."""
+    options.validate()
+    metadata = load_capture(path, verify_log=True)
+    startup = load_startup_calibration(path, metadata)
+    declared = metadata["profile"]["delta_ctrl"] if metadata else None
+    recorded = startup.delta_ctrl if startup else declared
+    ctrl = options.delta_ctrl if options.delta_ctrl is not None else recorded
+    if ctrl is None:
+        raise ValueError("模式 3 缺少 DLT_CTRL 记录；请在界面填写传感器采集时的实际值")
+    if startup and (startup.mode != 3 or startup.delta_ctrl != ctrl):
+        raise ValueError("模式 / DLT_CTRL 与板端启动标定 B/JSON 冲突")
+    if metadata and metadata["profile"]["delta_ctrl_confirmed"] and ctrl != declared:
+        raise ValueError(f"DLT_CTRL 与采集时已核对值 0x{declared:04X} 冲突")
+    if options.apply_startup_calibration and startup is None:
+        raise ValueError("未找到有效板端启动标定 B/JSON；旧日志可明确取消“模式3：应用板端启动标定”")
+    notes = [f"模式 3 增量输入，DLT_CTRL=0x{ctrl:04X}；按帧末时间覆盖此前采样区间"]
+    if options.apply_startup_calibration:
+        notes.append(f"已应用板端启动标定 {startup.samples} 帧：扣除 XYZ 陀螺静止均值（含地球自转），不补偿加速度")
+    else:
+        notes.append("模式 3 未应用板端启动标定；使用原始增量")
+    if not metadata or not metadata["profile"]["delta_ctrl_confirmed"]:
+        notes.append("DLT_CTRL 无采集时已核对记录，须与传感器实际配置一致")
+    if metadata and not metadata.get("finished"):
+        notes.append("采集未正常结束，配套 JSON 未完成日志完整性校验")
+    return ctrl, startup if options.apply_startup_calibration else None, notes
+
+
+def _convert_incremental_imu(imu: List[ImuObs], times: List[float], ctrl: int,
+                             startup: Optional[StartupCalibration]) -> None:
+    """Convert each interval integral to its mean rate for the planar propagator.
+
+    Propagation must use this SAME interval and the sample at its right endpoint.
+    Splitting at GNSS epochs then consumes the increment exactly once in total.
+    """
+    gaps = np.diff(times) / 1000
+    if not np.isfinite(gaps).all() or np.any(gaps < .004) or np.any(gaps > .006):
+        raise ValueError("模式 3 IMU 间隔必须为 4–6 ms 且严格递增；丢帧请分段处理")
+    intervals = np.r_[np.median(gaps), gaps]
+    angle_scale, velocity_scale = delta_scales(ctrl)
+    means = [degrees(v) for v in startup.stationary_rate] if startup else [0., 0., 0.]
+    for index, (sample, dt) in enumerate(zip(imu, intervals)):
+        if index:
+            previous = imu[index-1]
+            if ((sample.count - previous.count) & 0xFFFF) not in (312, 313):
+                raise ValueError("模式 3 IMU COUNT 不连续；不能把丢帧间隔当作单帧积分时长")
+            if sample.capture_ticks is not None and previous.capture_ticks is not None:
+                if sample.drdy_sequence != previous.drdy_sequence + 1:
+                    raise ValueError("模式 3 DRDY 序号不连续，请分段处理")
+                if sample.capture_ticks <= previous.capture_ticks:
+                    raise ValueError("模式 3 DRDY 时间非严格递增")
+        assert sample.angle_raw is not None and sample.velocity_raw is not None
+        sample.gyro_x_dps, sample.gyro_y_dps, sample.gyro_z_dps = (
+            v * angle_scale / dt - mean for v, mean in zip(sample.angle_raw, means))
+        sample.accel_x_mps2 = sample.velocity_raw[0] * velocity_scale / dt
+        sample.accel_y_mps2 = sample.velocity_raw[1] * velocity_scale / dt
 
 
 class _Ekf:
@@ -329,11 +439,24 @@ def _estimate_static_imu(imu: List[ImuObs], positions: List[PosObs],
 
 
 def run_fusion(path: Path, geometry: Geometry,
-               calibrate_static_imu: bool = False) -> FusionResult:
+               calibrate_static_imu: bool = False,
+               imu_options: Optional[ImuInputOptions] = None) -> FusionResult:
     geometry.validate()
-    imu, positions, headings, rejected = _parse_log(path)
+    warnings: List[str] = []
+    imu, positions, headings, rejected = _parse_log(path, warnings)
     if len(imu) < 20 or len(positions) < 2:
-        raise ValueError("需要至少 20 帧模式 2 IMU 和 2 条有效 BESTNAVA")
+        raise ValueError("需要至少 20 帧模式 2 或模式 3 IMU 和 2 条有效 BESTNAVA")
+    modes = {obs.mode for obs in imu}
+    if len(modes) != 1:
+        raise ValueError("IMU 模式 2/3 混用，请按模式分段回放")
+    incremental = modes == {3}
+    ctrl, startup = None, None
+    if incremental:
+        ctrl, startup, input_notes = incremental_settings(path, imu_options or ImuInputOptions())
+        warnings.extend(input_notes)
+        # Do not sort away a reset / reordered interval integral.
+        if any(b.mcu_ms <= a.mcu_ms for a, b in zip(imu, imu[1:])):
+            raise ValueError("模式 3 MCU 时间非严格递增，请分段处理")
     imu.sort(key=lambda x: x.mcu_ms)
     positions.sort(key=lambda x: x.gps_ms)
     headings.sort(key=lambda x: x.gps_ms)
@@ -346,17 +469,32 @@ def run_fusion(path: Path, geometry: Geometry,
     sync = analyze_sync(path)
     captured = [obs for obs in imu if obs.capture_ticks is not None]
     use_hardware = sync.locked and len(captured) >= 0.98 * len(imu)
+    # DRDY still defines precise IMU intervals if PPS cannot anchor GPS time.
+    # In that case retain the old GNSS-to-MCU arrival fit, with a local DRDY origin.
+    local_drdy = incremental and not use_hardware and len(captured) >= 0.98 * len(imu)
     if use_hardware:
         assert sync.tick_rate is not None
         local_capture_ms = np.array([sync.tick_to_local_ms(obs.capture_ticks) for obs in captured])
         local_mcu_ms = np.array([obs.mcu_ms for obs in captured], dtype=float)
         capture_slope, capture_offset = np.polyfit(local_mcu_ms - local_mcu_ms[0],
                                                   local_capture_ms, 1)
+    elif local_drdy:
+        local_mcu_ms = np.array([obs.mcu_ms for obs in captured], dtype=float)
+        local_capture_ms = np.array([captured[0].mcu_ms +
+                                    (obs.capture_ticks - captured[0].capture_ticks) / 4000
+                                    for obs in captured])
+        capture_slope, capture_offset = np.polyfit(local_mcu_ms - local_mcu_ms[0],
+                                                  local_capture_ms, 1)
+        warnings.append("仅使用 DRDY 确定 IMU 间隔；GNSS 仍采用串口到达拟合，未建立 PPS/GPS 同步")
 
     def imu_event_ms(obs: ImuObs) -> float:
         if use_hardware:
             if obs.capture_ticks is not None:
                 return sync.tick_to_local_ms(obs.capture_ticks)
+            return float(capture_slope * (obs.mcu_ms - local_mcu_ms[0]) + capture_offset)
+        if local_drdy:
+            if obs.capture_ticks is not None:
+                return captured[0].mcu_ms + (obs.capture_ticks - captured[0].capture_ticks) / 4000
             return float(capture_slope * (obs.mcu_ms - local_mcu_ms[0]) + capture_offset)
         return float(obs.mcu_ms)
 
@@ -365,6 +503,19 @@ def run_fusion(path: Path, geometry: Geometry,
             return sync.gps_ms_to_local_ms(gps_ms)
         return slope * (gps_ms - gps0) + offset - geometry.gnss_delay_ms
 
+    imu_times = [imu_event_ms(sample) for sample in imu]
+    if incremental:
+        _convert_incremental_imu(imu, imu_times, ctrl, startup)
+        if not use_hardware and not local_drdy:
+            warnings.append("DRDY 不足：增量按 MCU 帧间隔换算，时间分辨率较低；首帧间隔取中位数")
+        elif len(captured) < len(imu):
+            warnings.append(f"{len(imu)-len(captured)} 帧缺少 DRDY，时间使用局部拟合补齐")
+        # Never keep using the last integral after its endpoint, or integrate
+        # before the first known endpoint using an invented control interval.
+        positions = [p for p in positions if imu_times[0] <= event_ms(p.gps_ms) <= imu_times[-1]]
+        headings = [h for h in headings if imu_times[0] <= event_ms(h.gps_ms) <= imu_times[-1]]
+        if len(positions) < 2:
+            raise ValueError("模式 3 的 IMU 时间范围内需至少 2 条有效 BESTNAVA")
     calibration = (_estimate_static_imu(imu, positions, imu_event_ms, event_ms)
                    if calibrate_static_imu else None)
     if calibration and calibration.applied:
@@ -374,6 +525,8 @@ def run_fusion(path: Path, geometry: Geometry,
             obs.gyro_z_dps -= calibration.gyro_z_dps
             obs.accel_x_mps2 -= calibration.accel_x_mps2
             obs.accel_y_mps2 -= calibration.accel_y_mps2
+        if startup:
+            warnings.append("前 3 秒额外标定使用已扣板端均值的数据，只扣本段残余均值，不重复扣同一份 B 标定")
 
     def corrected_control(obs: ImuObs) -> Tuple[float, float, float]:
         return (obs.accel_x_mps2,
@@ -395,7 +548,6 @@ def run_fusion(path: Path, geometry: Geometry,
         if h.status == "SOL_COMPUTED" and h.solution in ("NARROW_INT", "NARROW_FLOAT", "L1_INT", "L1_FLOAT")
         and 0 < h.heading_std_deg < 20 and h.baseline_m > 0
     }
-    imu_times = [imu_event_ms(sample) for sample in imu]
     gyro_prefix = np.concatenate(([0.0], np.cumsum(
         [sample.gyro_z_dps * geometry.gyro_heading_sign for sample in imu])))
     paired_rates = []
@@ -422,7 +574,6 @@ def run_fusion(path: Path, geometry: Geometry,
         candidates = [(abs(h.gps_ms - first.gps_ms), h) for h in heading_by_gps.values()]
         if candidates and min(candidates, key=lambda item: item[0])[0] <= 200:
             first_h = min(candidates, key=lambda item: item[0])[1]
-    warnings: List[str] = []
     if first_h is not None:
         heading_rad = radians(first_h.heading_deg + geometry.heading_offset_deg)
     elif first.speed_mps > 1:
@@ -435,7 +586,8 @@ def run_fusion(path: Path, geometry: Geometry,
     lever_e, lever_n = _lever_en(heading_rad, geometry)
     track_rad = radians(first.track_deg)
     ve, vn = first.speed_mps * sin(track_rad), first.speed_mps * cos(track_rad)
-    imu_index = max(0, bisect_right(imu_times, event_ms(first.gps_ms)) - 1)
+    imu_index = (min(bisect_left(imu_times, event_ms(first.gps_ms)), len(imu)-1) if incremental
+                 else max(0, bisect_right(imu_times, event_ms(first.gps_ms)) - 1))
     initial_omega = corrected_control(imu[imu_index])[2]
     ve -= initial_omega * lever_n
     vn += initial_omega * lever_e
@@ -458,6 +610,10 @@ def run_fusion(path: Path, geometry: Geometry,
             if kind == 2:
                 control = corrected_control(obs)
             continue
+        if incremental:
+            # Mode 3 is an interval ending at this sample, not a sample-and-hold
+            # control for the next interval. GNSS events split the SAME integral.
+            control = corrected_control(imu[min(bisect_left(imu_times, event_t), len(imu)-1)])
         if event_t > previous_time:
             remaining = (event_t - previous_time) / 1000.0
             while remaining > 1e-9:
@@ -519,6 +675,7 @@ def run_fusion(path: Path, geometry: Geometry,
     warnings.append("二维模型未补偿横滚、俯仰及重力投影；轨迹不能作为精度真值")
     if ekf.rejected:
         warnings.append(f"滤波器拒绝 {ekf.rejected} 次大残差观测")
-    return FusionResult(frames, gnss_points, lat0, lon0, float(slope), fit_rms, correlation,
+    return PlanarFusionResult(frames, gnss_points, lat0, lon0, float(slope), fit_rms, correlation,
                         len(imu), len(positions), len(headings), rejected, warnings,
-                        use_hardware, len(sync.pps), calibration)
+                        use_hardware, len(sync.pps), calibration, imu_input_mode=3 if incremental else 2,
+                        delta_ctrl=ctrl, board_startup_calibration=startup)

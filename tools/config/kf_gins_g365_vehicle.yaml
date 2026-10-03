@@ -1,0 +1,38 @@
+# G365 vehicle replay profile, evaluated on 2026-10-03 logs 160516 / 160557.
+# Full 21-state KF-GINS; use with heading and Doppler velocity aiding enabled.
+# Units and stochastic model are identical to upstream KF-GINS.
+# This is a replay tuning profile, not a sensor calibration certificate.
+# Paths, timing, initial navigation state and antenna lever are set by the GUI.
+imupath: ""
+gnsspath: ""
+outputpath: ""
+imudatalen: 7
+imudatarate: 200
+starttime: 0
+endtime: -1
+initpos: [0, 0, 0]
+initvel: [0, 0, 0]
+initatt: [0, 0, 0]
+antlever: [0, 0, 0]
+initgyrbias: [0, 0, 0]  # deg/h; replay sets zero after board startup correction
+initaccbias: [0, 0, 0]  # mGal; estimated online, no log-fitted bias hardcoded
+initgyrscale: [0, 0, 0] # ppm
+initaccscale: [0, 0, 0] # ppm
+initposstd: [0.1, 0.1, 0.2]   # m
+initvelstd: [0.05, 0.05, 0.05] # m/s
+initattstd: [2, 2, 3]         # deg; approximate level + short dual-antenna baseline
+initbgstd: [50, 50, 50]       # deg/h; unchanged gyro prior
+# 10000 mGal = 0.1 m/s^2 (40x original initial sigma). Startup B calibrates
+# gyro only. Separate P0 from the bias process noise so bias can converge
+# without being allowed to wander rapidly after initialization.
+initbastd: [10000, 10000, 10000]
+initsgstd: [1000, 1000, 1000]  # ppm
+initsastd: [1000, 1000, 1000]  # ppm
+imunoise:
+  arw: [0.24, 0.24, 0.24]      # deg/sqrt(h), unchanged
+  vrw: [0.5, 0.5, 0.5]         # m/s/sqrt(h), modest increase from 0.24
+  gbstd: [50, 50, 50]          # deg/h
+  abstd: [250, 250, 250]       # mGal, unchanged process model
+  gsstd: [1000, 1000, 1000]    # ppm
+  asstd: [1000, 1000, 1000]    # ppm
+  corrtime: 1.0               # h

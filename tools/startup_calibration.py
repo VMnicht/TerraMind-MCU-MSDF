@@ -48,3 +48,31 @@ def read_calibration(path: Path) -> StartupCalibration | None:
                     raise ValueError("日志包含不同启动标定结果，请分段处理")
                 result = current
     return result
+
+
+def load_startup_calibration(path: Path, metadata: dict | None = None) -> StartupCalibration | None:
+    """Read B and cross-check the capture sidecar; never guess missing means.
+
+    Callers must verify the sidecar's log hash with load_capture(verify_log=True).
+    A JSON-only fallback requires a successfully completed capture.
+    """
+    record = read_calibration(path)
+    data = metadata.get("startup_calibration") if metadata else None
+    if data is None:
+        return record
+    try:
+        rates, std = data["rate_nrad_s"], data["std_nrad_s"]
+        if len(rates) != 3 or len(std) != 3:
+            raise ValueError("标定向量必须有三个轴")
+        values = [data[key] for key in ("mcu_ms", "mode", "delta_ctrl", "samples", "duration_us")]
+        values += list(rates) + list(std) + [data["temperature_mc"]]
+        if any(type(v) is not int for v in values):
+            raise ValueError("标定字段必须为整数")
+        saved = parse_calibration("B,1," + ",".join(map(str, values)))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"JSON 启动标定记录无效：{exc}") from exc
+    if record and record.identity() != saved.identity():
+        raise ValueError("日志 B 与 JSON 启动标定记录冲突")
+    if record is None and metadata.get("finished") is not True:
+        raise ValueError("仅 JSON 含启动标定，但采集未完成，无法确认适用于本日志")
+    return record or saved

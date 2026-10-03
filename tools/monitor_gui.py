@@ -18,6 +18,27 @@ from monitor_protocol import MonitorModel
 from capture_profile import CaptureProfile, RawCapture, load_capture
 
 
+def corrected_delta_text(model: MonitorModel, profile: Optional[CaptureProfile], now: float) -> str:
+    """Keep the row present and use one complete sample/timing pair only."""
+    prefix = "去静止均值 Δθ °: "
+    calibration = model.calibration
+    if profile is None:
+        return prefix + "— 配置无效"
+    if calibration is None:
+        return prefix + "— 等待板端标定记录"
+    if calibration.mode != 3 or calibration.delta_ctrl != profile.delta_ctrl:
+        return prefix + "— 标定模式/比例不匹配"
+    pair = model.imu_display_pair
+    if pair is None or pair[0].mode != 3:
+        return prefix + "— 等待有效 I/T 配对"
+    sample, dt, received_at = pair
+    if now - received_at > 0.2:
+        return prefix + "— 完整帧已过期"
+    angle, _ = sample.increments(profile.delta_ctrl)
+    corrected = [a - degrees(b) * dt for a, b in zip(angle, calibration.stationary_rate)]
+    return prefix + " ".join(f"{v:+.6g}" for v in corrected) + "（最近完整帧）"
+
+
 class InputWorker(threading.Thread):
     def __init__(self, output: queue.Queue, port: Optional[str] = None,
                  replay: Optional[Path] = None) -> None:
@@ -422,11 +443,7 @@ class Dashboard:
                     axes += "\nΔv m/s: " + " ".join(f"{v:+.6g}" for v in velocity)
                     axes += f"\nDLT_CTRL=0x{profile.delta_ctrl:04X} " + (
                         "人工已核对" if profile.delta_ctrl_confirmed else "未核对，仅供预览")
-                    if (calibration and calibration.mode == imu.mode and
-                            calibration.delta_ctrl == profile.delta_ctrl and self.model.imu_dt_s):
-                        corrected = [a-degrees(b)*self.model.imu_dt_s
-                                     for a,b in zip(angle, calibration.stationary_rate)]
-                        axes += "\n去静止均值 Δθ °: " + " ".join(f"{v:+.6g}" for v in corrected)
+                axes += "\n" + corrected_delta_text(self.model, profile, now)
             elif calibration and calibration.mode == 2:
                 corrected = [a-degrees(b) for a,b in zip(imu.gyro_dps, calibration.stationary_rate)]
                 axes += "\n去静止均值 °/s: " + " ".join(f"{v:+.6g}" for v in corrected)

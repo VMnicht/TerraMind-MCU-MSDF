@@ -5,6 +5,7 @@ Mode switching intentionally does not write SMPL_CTRL, FILTER_CTRL,
 UART_CTRL, MSC_CTRL, POL_CTRL, or GLOB_CMD3. DRDY has a separate control that
 only updates MSC_CTRL.DRDY_ON/DRDY_POL. Flash backup is available only as a
 separate, explicit, confirmed user action.
+Delta scaling has a separate readback-verified low-byte configuration action.
 """
 
 from __future__ import annotations
@@ -24,6 +25,15 @@ import winreg
 BAUD_RATE = 230400
 CR = 0x0D
 ADDRESS = 0x80
+
+
+def delta_range_text(angle_code: int, rate: float | None) -> str:
+    """G365PDF1 32-bit representation range, not the physical gyro range."""
+    limit = (2**31 - 1) * (1 / 66 / 2000) * 2**angle_code / 65536
+    text = f"G365PDF1 角增量表示范围 ±{limit:.6f}°/帧"
+    if rate is not None:
+        text += f"；{rate:g} Hz 下等效 ±{limit * rate:.2f}°/s"
+    return text + "（不扩大传感器物理量程）"
 
 
 @dataclass(frozen=True)
@@ -390,6 +400,16 @@ class G366Protocol:
         self.write8(0x02, new_low)
         return self.read16(0x02)
 
+    def configure_delta_scale(self, angle: int, velocity: int) -> int:
+        if type(angle) is not int or type(velocity) is not int or not (
+            0 <= angle <= 15 and 0 <= velocity <= 15
+        ):
+            raise ValueError("增量比例代码必须为 0–15 的整数")
+        self.select_window(1)
+        # W1:0x13 is NOT written: preserve high-byte fields/reserved bits.
+        self.write8(0x12, (angle << 4) | velocity)
+        return self.read16(0x12)
+
     def restore_drdy(self, old_msc: int):
         """Restore the documented MSC_CTRL low-byte fields without touching 0x03."""
         self.select_window(1)
@@ -526,9 +546,15 @@ class FrameDecoder:
             angle_sf = 7.576e-6 * (2 ** self.delta_angle_code)
             velocity_sf = (2.452e-6 if self.accel_16g else 1.226e-6) * (2 ** self.delta_velocity_code)
             for axis in "xyz":
-                out[f"delta_angle_{axis}"] = s32() * angle_sf / 65536.0
+                raw = s32()
+                out[f"delta_angle_{axis}"] = raw * angle_sf / 65536.0
+                if raw in (-2147483648, 2147483647):
+                    out["angle_saturated"] = 1
             for axis in "xyz":
-                out[f"delta_velocity_{axis}"] = s32() * velocity_sf / 65536.0
+                raw = s32()
+                out[f"delta_velocity_{axis}"] = raw * velocity_sf / 65536.0
+                if raw in (-2147483648, 2147483647):
+                    out["velocity_saturated"] = 1
 
         if p.attitude_bits:
             for name in ("roll", "pitch", "yaw"):
@@ -548,6 +574,7 @@ class MonitorState:
         self.latest = {}
         self.raw_hex = ""
         self.times = deque()
+        self.angle_saturated = self.velocity_saturated = self.flag_errors = 0
 
     def reset(self):
         with self.lock:
@@ -556,6 +583,7 @@ class MonitorState:
             self.latest = {}
             self.raw_hex = ""
             self.times.clear()
+            self.angle_saturated = self.velocity_saturated = self.flag_errors = 0
 
     def add(self, frames, bad):
         now = time.monotonic()
@@ -563,6 +591,9 @@ class MonitorState:
             self.bad += bad
             for raw, decoded in frames:
                 self.total += 1
+                self.angle_saturated += bool(decoded.get("angle_saturated"))
+                self.velocity_saturated += bool(decoded.get("velocity_saturated"))
+                self.flag_errors += bool(decoded.get("flag", 0) & 0x0101)
                 self.latest = decoded
                 self.raw_hex = raw.hex(" ").upper()
                 self.times.append(now)
@@ -572,6 +603,10 @@ class MonitorState:
     def snapshot(self):
         with self.lock:
             return self.total, self.bad, len(self.times), dict(self.latest), self.raw_hex
+
+    def health_snapshot(self):
+        with self.lock:
+            return self.angle_saturated, self.velocity_saturated, self.flag_errors
 
 
 class HostBiasCalibrator:
@@ -706,6 +741,7 @@ class G366App:
         self.reader_thread: threading.Thread | None = None
         self.reader_stop = threading.Event()
         self.reader_pause = threading.Event()
+        self.reader_io_lock = threading.Lock()
         self.busy_lock = threading.Lock()
         self.decoder = FrameDecoder()
         self.monitor = MonitorState()
@@ -751,10 +787,23 @@ class G366App:
 
         body = ttk.Panedwindow(outer, orient="horizontal")
         body.pack(fill="both", expand=True, pady=10)
-        left = ttk.Frame(body, padding=(0, 0, 6, 0))
+        controls_pane = ttk.Frame(body, padding=(0, 0, 6, 0))
         right = ttk.Frame(body, padding=(6, 0, 0, 0))
-        body.add(left, weight=2)
+        body.add(controls_pane, weight=2)
         body.add(right, weight=3)
+        # Configuration can grow vertically without hiding the live monitor.
+        controls_canvas = tk.Canvas(controls_pane, width=510, highlightthickness=0)
+        controls_scroll = ttk.Scrollbar(controls_pane, orient="vertical",
+                                        command=controls_canvas.yview)
+        controls_scroll.pack(side="right", fill="y")
+        controls_canvas.pack(side="left", fill="both", expand=True)
+        controls_canvas.configure(yscrollcommand=controls_scroll.set)
+        left = ttk.Frame(controls_canvas)
+        controls_window = controls_canvas.create_window((0, 0), window=left, anchor="nw")
+        left.bind("<Configure>", lambda event: controls_canvas.configure(
+            scrollregion=controls_canvas.bbox("all")))
+        controls_canvas.bind("<Configure>", lambda event: controls_canvas.itemconfigure(
+            controls_window, width=event.width))
 
         modes_frame = ttk.LabelFrame(left, text="输出模式", padding=8, style="Mode.TLabelframe")
         modes_frame.pack(fill="x")
@@ -859,15 +908,46 @@ class G366App:
             justify="left", foreground="#704214",
         ).pack(anchor="w", pady=(6, 0))
         self.config_var = tk.StringVar(value="等待读取设备配置")
-        config = ttk.LabelFrame(right, text="设备配置（实际读回）", padding=8)
+        config = ttk.LabelFrame(left, text="设备配置（实际读回）", padding=8)
         config.pack(fill="x", pady=(0, 8))
         ttk.Label(config, textvariable=self.config_var, wraplength=500, justify="left").pack(anchor="w")
         ttk.Button(config, text="复制配置", command=self._copy_config).pack(anchor="e", pady=(4, 0))
 
-        live = ttk.LabelFrame(right, text="实时数据", padding=8)
+        delta = ttk.LabelFrame(left, text="G365PDF1 增量比例（独立配置）", padding=8)
+        delta.pack(fill="x", pady=(0, 8))
+        self.delta_angle_var = tk.StringVar(value="0")
+        self.delta_velocity_var = tk.StringVar(value="8")
+        for column, (label, variable) in enumerate((("角增量代码", self.delta_angle_var),
+                                                    ("速度增量代码", self.delta_velocity_var))):
+            ttk.Label(delta, text=label).grid(row=0, column=column * 2, sticky="w")
+            combo = ttk.Combobox(delta, textvariable=variable, values=tuple(range(16)),
+                                 state="readonly", width=4)
+            combo.grid(row=0, column=column * 2 + 1, padx=(3, 8))
+            combo.bind("<<ComboboxSelected>>", lambda event: self._delta_preview())
+        self.delta_preview_var = tk.StringVar()
+        ttk.Label(delta, textvariable=self.delta_preview_var, wraplength=500,
+                  foreground="#1F4E79").grid(row=1, column=0, columnspan=4, sticky="w", pady=4)
+        buttons = ttk.Frame(delta)
+        buttons.grid(row=2, column=0, columnspan=4, sticky="ew")
+        ttk.Button(buttons, text="填入推荐值 4 / 8", command=self._delta_recommended).pack(side="left")
+        self.delta_apply_btn = ttk.Button(buttons, text="应用比例（不保存Flash）",
+                                         command=self._apply_delta, state="disabled")
+        self.delta_apply_btn.pack(side="left", padx=4)
+        self.delta_read_btn = ttk.Button(buttons, text="重新读取",
+                                        command=lambda: self._apply_delta(read_only=True), state="disabled")
+        self.delta_read_btn.pack(side="left")
+        self.delta_status_var = tk.StringVar(value="等待读回；推荐值仅填入，不自动写设备。")
+        ttk.Label(delta, textvariable=self.delta_status_var, wraplength=500).grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._delta_preview()
+
+        live = ttk.LabelFrame(right, text="实时数据与操作日志", padding=8)
         live.pack(fill="both", expand=True)
         self.stats_var = tk.StringVar(value="帧 0 · 校验错误 0 · 0 Hz")
         ttk.Label(live, textvariable=self.stats_var).pack(anchor="w", pady=(0, 8))
+        self.health_var = tk.StringVar(value="角增量饱和 0 · 速度增量饱和 0 · 错误FLAG 0")
+        ttk.Label(live, textvariable=self.health_var, foreground="#B03020",
+                  wraplength=500).pack(anchor="w", pady=(0, 4))
         self.tree = ttk.Treeview(live, columns=("x", "y", "z", "unit"), show="tree headings", height=8)
         self.tree.heading("#0", text="数据")
         self.tree.column("#0", width=105, anchor="w")
@@ -887,9 +967,27 @@ class G366App:
         ttk.Label(live, text="最新有效帧（HEX）").pack(anchor="w")
         self.hex_text = tk.Text(live, height=4, wrap="word", state="disabled", font=("Consolas", 9))
         self.hex_text.pack(fill="x", pady=(3, 8))
-        ttk.Label(live, text="运行日志").pack(anchor="w")
-        self.log_text = tk.Text(live, height=10, wrap="word", state="disabled", font=("Consolas", 9))
-        self.log_text.pack(fill="both", expand=True, pady=(3, 0))
+        ttk.Label(live, text="操作 / 运行日志").pack(anchor="w")
+        log_frame = ttk.Frame(live)
+        log_frame.pack(fill="both", expand=True, pady=(3, 0))
+        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled", font=("Consolas", 9))
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        def scroll_controls(event):
+            controls_canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+
+        def bind_controls_scroll(widget):
+            if widget.winfo_class() != "TCombobox":
+                widget.bind("<MouseWheel>", scroll_controls)
+            for child in widget.winfo_children():
+                bind_controls_scroll(child)
+
+        bind_controls_scroll(left)
+        controls_canvas.bind("<MouseWheel>", scroll_controls)
 
     def _refresh_ports(self):
         ports = available_ports()
@@ -914,6 +1012,8 @@ class G366App:
         threading.Thread(target=func, daemon=True).start()
 
     def _toggle_connection(self):
+        if self.busy_lock.locked():
+            return
         if self.connected:
             self._disconnect()
         else:
@@ -1000,6 +1100,10 @@ class G366App:
         self.connected = False
         self.tx_ready = False
         self.current_mode = None
+        self.current_regs = {}
+        self.delta_apply_btn.configure(state="disabled")
+        self.delta_read_btn.configure(state="disabled")
+        self.delta_status_var.set("未连接；待重新读回配置。")
         self.calibrator.cancel()
         self.gyro_bias = {axis: 0.0 for axis in "xyz"}
         self.apply_btn.configure(state="disabled")
@@ -1020,19 +1124,22 @@ class G366App:
                 time.sleep(0.005)
                 continue
             try:
-                chunk = self.port.read(4096) if self.port else b""
-                if chunk:
-                    frames, bad = self.decoder.feed(chunk)
-                    self.monitor.add(frames, bad)
-                    for _, decoded in frames:
-                        self.calibrator.add(decoded)
+                with self.reader_io_lock:
+                    if self.reader_pause.is_set():
+                        continue
+                    chunk = self.port.read(4096) if self.port else b""
+                    if chunk:
+                        frames, bad = self.decoder.feed(chunk)
+                        self.monitor.add(frames, bad)
+                        for _, decoded in frames:
+                            self.calibrator.add(decoded)
             except Exception as exc:
                 if not self.reader_stop.is_set():
                     self._post("error", f"接收失败：{exc}")
                 return
 
     def _request_burst(self):
-        if not self.port or not self.connected:
+        if not self.port or not self.connected or self.busy_lock.locked():
             return
         try:
             self.port.write(bytes([0x80, 0x00, CR]))
@@ -1051,7 +1158,105 @@ class G366App:
     def _mode_has_gyro(self):
         return bool(self.current_mode and self.current_mode.gyro_bits)
 
+    def _delta_preview(self):
+        angle, velocity = int(self.delta_angle_var.get()), int(self.delta_velocity_var.get())
+        high = self.current_regs.get("glob3", 0) & 0xFF00
+        rate = DOUT_RATES.get((self.current_regs.get("smpl", 0xFF00) >> 8) & 255)
+        self.delta_preview_var.set(
+            f"待写入：0x{high | angle << 4 | velocity:04X}（高字节保持实际值）\n"
+            + delta_range_text(angle, rate))
+
+    def _delta_recommended(self):
+        self.delta_angle_var.set("4")
+        self.delta_velocity_var.set("8")
+        self._delta_preview()
+
+    def _sync_delta_ui(self):
+        if self.current_regs:
+            value = self.current_regs["glob3"]
+            self.delta_angle_var.set(str((value >> 4) & 15))
+            self.delta_velocity_var.set(str(value & 15))
+        self._delta_preview()
+
+    def _apply_delta(self, read_only=False):
+        if not self.connected or not self.tx_ready or self.busy_lock.locked():
+            return
+        angle, velocity = int(self.delta_angle_var.get()), int(self.delta_velocity_var.get())
+        self.calibrator.cancel()
+        self.gyro_bias = {axis: 0.0 for axis in "xyz"}
+        self.clear_calib_btn.configure(state="disabled")
+        self.calib_var.set("配置操作已清除上位机标定；完成后请重新静止标定。板端接回后也须重新标定。")
+        for button in (self.apply_btn, self.flash_btn, self.drdy_apply_btn, self.calib_btn,
+                       self.delta_apply_btn, self.delta_read_btn, self.connect_btn, self.burst_btn):
+            button.configure(state="disabled")
+        self.status_var.set("正在读取增量配置…" if read_only else "正在应用增量比例…")
+        self._async(lambda: self._delta_worker(None if read_only else (angle, velocity)))
+
+    def _delta_worker(self, codes):
+        if not self.busy_lock.acquire(blocking=False):
+            self._post("delta_result", (False, "设备正在执行其他操作，未写入。"))
+            return
+        self.reader_pause.set()
+        before = None
+        attempted = False
+        try:
+            with self.reader_io_lock:
+                try:
+                    assert self.port and self.protocol
+                    self.port.purge_rx()
+                    self.protocol.enter_configuration()
+                    before = self.protocol.snapshot()
+                    expected = dict(before)
+                    if codes is not None:
+                        expected["glob3"] = (before["glob3"] & 0xFF00) | (codes[0] << 4) | codes[1]
+                        attempted = True  # A failed write may still reach the sensor.
+                        value = self.protocol.configure_delta_scale(*codes)
+                        if value != expected["glob3"]:
+                            raise SerialError(f"DLT_CTRL 回读不一致：0x{value:04X}")
+                    after = self.protocol.snapshot()
+                    if after != expected:
+                        raise SerialError("配置快照不一致：比例或其他寄存器发生意外变化")
+                    self.protocol.enter_sampling()
+                    self.current_regs = after
+                    self.current_mode = identify_mode(after)
+                    self.decoder.configure(self.current_mode, after["glob3"])
+                    self.monitor.reset()
+                    self.port.purge_rx()
+                    action = "已读回" if codes is None else "已应用，尚未保存Flash"
+                    self._post("delta_result", (True,
+                        f"{action}：DLT_CTRL=0x{after['glob3']:04X}。板端和采集参数须与此值一致。"))
+                except Exception as exc:
+                    try:
+                        if before is None:
+                            raise SerialError("未取得完整配置快照")
+                        self.protocol.enter_configuration()
+                        if attempted:
+                            self.protocol.configure_delta_scale((before["glob3"] >> 4) & 15,
+                                                                before["glob3"] & 15)
+                        restored = self.protocol.snapshot()
+                        if restored != before:
+                            raise SerialError("恢复读回与原配置不一致")
+                        self.protocol.enter_sampling()
+                        self.current_regs = restored
+                        self.current_mode = identify_mode(restored)
+                        self.decoder.configure(self.current_mode, restored["glob3"])
+                        self.monitor.reset()
+                        self.port.purge_rx()
+                        detail = "已读回确认原配置并恢复采样。"
+                    except Exception as restore_exc:
+                        self.tx_ready = False
+                        self.current_regs = {}
+                        self.current_mode = None
+                        self.decoder.configure(None, 0)
+                        self.monitor.reset()
+                        detail = f"无法确认设备状态：{restore_exc}；已停用解码和写入，请重新连接。"
+                    self._post("delta_result", (False, f"操作失败：{exc}；{detail}"))
+        finally:
+            self.reader_pause.clear()
+            self.busy_lock.release()
+
     def _sync_drdy_ui(self):
+        self._sync_delta_ui()
         if not self.current_regs:
             self.drdy_status_var.set("寄存器不可读；DRDY配置已禁用。")
             return
@@ -1385,6 +1590,7 @@ class G366App:
             f"角增量比例代码：{(r['glob3'] >> 4) & 0x0F}"
             f"（0x{(r['glob3'] >> 4) & 0x0F:X}），"
             f"速度增量比例代码：{r['glob3'] & 0x0F}（0x{r['glob3'] & 0x0F:X}）"
+            "\n" + delta_range_text((r['glob3'] >> 4) & 15, DOUT_RATES.get(rate_code))
         )
 
     def _copy_config(self):
@@ -1422,6 +1628,8 @@ class G366App:
                         "寄存器不可读；下方物理量按出厂 ±8 g / 默认比例近似显示。"
                     )
                     self._sync_drdy_ui()
+                    self.delta_status_var.set("已读取当前设备配置；填入推荐值后点击应用才会写入。"
+                                              if tx_ready else "仅监听：不能确认比例，配置已禁用。")
                     self._log(f"已连接 {port_name}；当前模式：{mode_text}。")
                     if warning:
                         self._log(warning)
@@ -1440,6 +1648,8 @@ class G366App:
                     )
                 elif kind == "flash_saved":
                     self.status_var.set("Flash 保存成功")
+                    self.delta_status_var.set(
+                        f"Flash 保存成功；当前读回 DLT_CTRL=0x{self.current_regs['glob3']:04X}。")
                     self.apply_btn.configure(state="normal")
                     self.flash_btn.configure(state="normal")
                     self.drdy_apply_btn.configure(state="normal")
@@ -1464,11 +1674,24 @@ class G366App:
                         f"DRDY配置完成：MSC_CTRL 0x{before_msc:04X} -> 0x{after_msc:04X}；"
                         "只修改DRDY_ON/DRDY_POL，其他寄存器已逐项回读确认未变。尚未写Flash。"
                     )
+                elif kind == "delta_result":
+                    success, message = payload
+                    self.status_var.set("增量配置操作完成" if success else "增量配置操作失败")
+                    self.delta_status_var.set(message)
+                    self.config_var.set(self._config_text())
+                    self._sync_drdy_ui()
+                    self.connect_btn.configure(state="normal")
+                    for button in (self.apply_btn, self.flash_btn, self.drdy_apply_btn, self.burst_btn):
+                        button.configure(state="normal" if self.tx_ready else "disabled")
+                    self.calib_btn.configure(state="normal" if self._mode_has_gyro() else "disabled")
+                    self._log(message)
+                    if not success:
+                        messagebox.showerror("增量比例配置失败", message)
                 elif kind == "error":
                     self.status_var.set("操作失败")
                     self.connect_btn.configure(state="normal")
                     if self.connected:
-                        self.apply_btn.configure(state="normal")
+                        self.apply_btn.configure(state="normal" if self.tx_ready else "disabled")
                         self.flash_btn.configure(state="normal" if self.tx_ready else "disabled")
                         self.drdy_apply_btn.configure(state="normal" if self.tx_ready else "disabled")
                         self.calib_btn.configure(state="normal" if self._mode_has_gyro() else "disabled")
@@ -1479,6 +1702,13 @@ class G366App:
 
         total, bad, hz, data, raw_hex = self.monitor.snapshot()
         self.stats_var.set(f"有效帧 {total} · 校验/同步错误 {bad} · 最近 {hz} Hz")
+        angle_sat, velocity_sat, flag_errors = self.monitor.health_snapshot()
+        self.health_var.set(
+            f"角增量饱和 {angle_sat} · 速度增量饱和 {velocity_sat} · 错误FLAG {flag_errors}"
+            + ("\n检测到削顶：请检查增量比例并重新采集。" if angle_sat or velocity_sat else ""))
+        delta_ready = self.connected and self.tx_ready and not self.busy_lock.locked()
+        for button in (self.delta_apply_btn, self.delta_read_btn):
+            button.configure(state="normal" if delta_ready else "disabled")
         active, elapsed, duration, sample_count = self.calibrator.status()
         if active:
             if elapsed > duration + 2.0:
@@ -1523,6 +1753,9 @@ class G366App:
         self.root.after(100, self._poll_ui)
 
     def _on_close(self):
+        if self.busy_lock.locked():
+            self.status_var.set("正在完成设备操作，请稍后关闭。")
+            return
         if self.connected:
             self._disconnect()
         self.root.destroy()

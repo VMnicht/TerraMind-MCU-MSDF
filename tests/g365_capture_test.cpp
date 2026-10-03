@@ -59,7 +59,7 @@ static void make_frame(uint8_t *out, uint16_t flag, int16_t temperature,
 int main()
 {
     G365Imu imu;
-    assert(imu.delta_ctrl() == 0x0008u);
+    assert(imu.delta_ctrl() == 0x0048u);
     // Keep coverage of the previous profile as an explicit, non-default setting.
     imu.set_delta_ctrl(0x00ccu);
     imu.set_sample_callback(on_sample, NULL);

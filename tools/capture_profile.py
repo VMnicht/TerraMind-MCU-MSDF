@@ -16,7 +16,7 @@ from startup_calibration import parse_calibration
 @dataclass(frozen=True)
 class CaptureProfile:
     expected_mode: int = 3
-    delta_ctrl: int = 0x0008  # Device readback supplied on 2026-10-02.
+    delta_ctrl: int = 0x0048  # Planned dynamic-capture setting; confirm physical readback.
     delta_ctrl_confirmed: bool = False
     sample_hz: int = 200
 
