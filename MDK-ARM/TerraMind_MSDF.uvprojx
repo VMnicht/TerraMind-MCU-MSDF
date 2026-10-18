@@ -952,8 +952,28 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>Navigation (dormant library)</GroupName>
+          <GroupName>Navigation (live 200 Hz / output 100 Hz)</GroupName>
           <Files>
+            <File>
+              <FileName>nav_output_protocol.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/Navigation/nav_output_protocol.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>navigation_live.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/Navigation/navigation_live.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>navigation_uart_dma.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/BSP/navigation_uart_dma.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>app_navigation.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../TerraMind_FW/App/app_navigation.cpp</FilePath>
+            </File>
             <File>
               <FileName>navigation.cpp</FileName>
               <FileType>8</FileType>

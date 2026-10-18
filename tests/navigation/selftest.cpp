@@ -39,7 +39,7 @@ static void defaultConfigTests() {
     }
     CHECK(cfg.output_hz==100 && cfg.buffer_delay_s==0.2 && cfg.correlation_time_s==3600);
     // With the default delay/rate, retain every IMU update and publish once per
-    // 10 ms. No heading or Doppler observations exist on the board API.
+    // 10 ms. No aiding observations have been supplied in this case.
     auto sample=fixture::imu(1);uint32_t count=0;
     CHECK(Nav_PushImu(c.ptr,&sample)==NAV_OK);
     CHECK(Nav_Process(c.ptr,sample.time_s+cfg.buffer_delay_s,1,&count)==NAV_OK && count==1);

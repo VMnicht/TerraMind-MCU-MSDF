@@ -20,13 +20,18 @@ bool ImuUartBsp::arm_receive()
     {
         return false;
     }
-    if (HAL_UART_Receive_IT(uart_, &receive_byte_, 1u) != HAL_OK)
+    // HAL enables error interrupts before finishing RxISR/RxState setup. An
+    // existing ORE can otherwise preempt startup and leave READY with armed_
+    // still true. Publish the receive setup atomically with respect to UART ISR.
+    const uint32_t mask=__get_PRIMASK();__disable_irq();
+    const HAL_StatusTypeDef status=HAL_UART_Receive_IT(uart_, &receive_byte_, 1u);
+    armed_=uart_->RxState!=HAL_UART_STATE_READY;
+    __set_PRIMASK(mask);
+    if (status != HAL_OK)
     {
         ++rearm_error_count_;
-        armed_ = false;
         return false;
     }
-    armed_ = true;
     return true;
 }
 
@@ -47,7 +52,7 @@ bool ImuUartBsp::start(UART_HandleTypeDef *uart)
 
 void ImuUartBsp::service()
 {
-    if (!armed_ && uart_ != NULL && uart_->RxState == HAL_UART_STATE_READY)
+    if (uart_ != NULL && uart_->RxState == HAL_UART_STATE_READY)
     {
         arm_receive();
     }

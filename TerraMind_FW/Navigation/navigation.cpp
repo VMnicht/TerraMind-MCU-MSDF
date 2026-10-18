@@ -1,5 +1,6 @@
 #include "navigation.h"
 #include "core/kf-gins/gi_engine.h"
+#include "core/kf-gins/gnss_aiding.h"
 #include "core/common/earth.h"
 #include "core/common/rotation.h"
 #include <algorithm>
@@ -66,7 +67,8 @@ struct NavContext {
     tmnav::GIEngine *engine;
     NavConfig config;
     NavImu imu[NAV_IMU_CAPACITY];
-    NavGnss gnss[NAV_GNSS_CAPACITY];
+    NavObservation gnss[NAV_GNSS_CAPACITY];
+    tmnav::BoardAidingStats aiding_stats;
     uint32_t imu_head, imu_size, gnss_head, gnss_size;
     double last_imu_time, last_gnss_input, next_publish, last_process_now, last_poll_now;
     uint64_t published_sequence;
@@ -98,6 +100,9 @@ void snapshot(NavContext *c) {
     copy3(out.state.position,state.pos); copy3(out.state.velocity,state.vel); copy3(out.state.attitude,state.euler);
     copy3(out.state.gyro_bias,state.imuerror.gyrbias); copy3(out.state.accel_bias,state.imuerror.accbias);
     copy3(out.state.gyro_scale,state.imuerror.gyrscale); copy3(out.state.accel_scale,state.imuerror.accscale);
+    const auto &q=c->engine->getQuaternion();
+    out.quaternion_bn[0]=q.w(); out.quaternion_bn[1]=q.x();
+    out.quaternion_bn[2]=q.y(); out.quaternion_bn[3]=q.z();
     const auto &p=c->engine->getCovariance();
     for(unsigned i=0;i<NAV_STATE_DIM;++i) out.std[i]=std::sqrt(p(i,i));
     out.issue_flags=c->stats.issue_flags;
@@ -160,6 +165,8 @@ extern "C" NavStatus Nav_Initialize(NavContext *c, const NavConfig *config, cons
     c->published_sequence=0; c->deadline_set=c->has_latest=false;
     c->latest=NavOutput{}; c->latest.last_gnss_time_s=-1;
     c->stats=NavStats{}; c->stats.running=1; c->stats.last_state_time_s=seed->time_s;
+    c->aiding_stats=tmnav::BoardAidingStats{};
+    c->stats.velocity_nis=c->stats.heading_nis=-1;
     return NAV_OK;
 }
 extern "C" NavStatus Nav_PushImu(NavContext *c, const NavImu *imu) {
@@ -184,6 +191,25 @@ extern "C" NavStatus Nav_PushGnss(NavContext *c, const NavGnss *g) {
     if(!c || !c->engine) return NAV_NOT_INITIALIZED;
     if(c->stats.faulted) return c->stats.last_error;
     if(!g || !validGnss(*g)) return rejected(c,NAV_INVALID_ARGUMENT);
+    NavObservation o{}; o.time_s=g->time_s; o.fields=NAV_OBS_POSITION;
+    std::copy(g->position_rad_m,g->position_rad_m+3,o.position_rad_m);
+    std::copy(g->std_ned_m,g->std_ned_m+3,o.position_std_m);
+    return Nav_PushObservation(c,&o);
+}
+extern "C" NavStatus Nav_PushObservation(NavContext *c, const NavObservation *g) {
+    if(!c || !c->engine) return NAV_NOT_INITIALIZED;
+    if(c->stats.faulted) return c->stats.last_error;
+    if(!g || !std::isfinite(g->time_s) || g->time_s<0 || !g->fields || (g->fields & ~7u))
+        return rejected(c,NAV_INVALID_ARGUMENT);
+    if((g->fields & NAV_OBS_POSITION) && (!validPosition(g->position_rad_m) ||
+       !finite3(g->position_std_m) || g->position_std_m[0]<=0 || g->position_std_m[1]<=0 || g->position_std_m[2]<=0))
+        return rejected(c,NAV_INVALID_ARGUMENT);
+    if((g->fields & NAV_OBS_VELOCITY) && (!finite3(g->velocity_ned_mps) ||
+       !finite3(g->velocity_std_mps) || g->velocity_std_mps[0]<=0 || g->velocity_std_mps[1]<=0 || g->velocity_std_mps[2]<=0))
+        return rejected(c,NAV_INVALID_ARGUMENT);
+    if((g->fields & NAV_OBS_HEADING) && (!std::isfinite(g->heading_rad) ||
+       !std::isfinite(g->heading_std_rad) || g->heading_std_rad<=0 || !std::isfinite(g->baseline_yaw_frd_rad)))
+        return rejected(c,NAV_INVALID_ARGUMENT);
     if(g->time_s<=c->last_gnss_input) return rejected(c,NAV_TIME_ORDER);
     if(g->time_s<c->engine->timestamp()-align_error) { ++c->stats.late_gnss; return rejected(c,NAV_LATE_GNSS); }
     if(c->gnss_size==NAV_GNSS_CAPACITY) { ++c->stats.gnss_overflows; return rejected(c,NAV_QUEUE_FULL,true); }
@@ -213,14 +239,27 @@ extern "C" NavStatus Nav_Process(NavContext *c, double now, uint32_t limit, uint
            c->engine->updateBranchFor(imu.time_s,c->gnss[(c->gnss_head+1)%NAV_GNSS_CAPACITY].time_s)!=0)
             return error(c,NAV_OBSERVATION_DENSITY,true);
         const uint32_t begin=c->cycle_clock?c->cycle_clock(c->clock_user):0;
+        tmnav::BoardObservation observation;
         if(update) {
-            const NavGnss &g=c->gnss[c->gnss_head];
+            const NavObservation &g=c->gnss[c->gnss_head];
             if(g.time_s<c->engine->timestamp()-align_error) return error(c,NAV_LATE_GNSS,true);
-            tmnav::GNSS input{}; input.time=g.time_s; input.blh=vec(g.position_rad_m); input.std=vec(g.std_ned_m);
-            c->engine->addGnssData(input);
+            observation.time=g.time_s;
+            observation.position=(g.fields & NAV_OBS_POSITION)!=0;
+            observation.velocity=(g.fields & NAV_OBS_VELOCITY)!=0;
+            observation.heading=(g.fields & NAV_OBS_HEADING)!=0;
+            if(observation.position) { observation.blh=vec(g.position_rad_m); observation.position_std=vec(g.position_std_m); }
+            if(observation.velocity) {
+                observation.velocity_ned=vec(g.velocity_ned_mps);
+                for(unsigned j=0;j<3;++j) observation.velocity_std[j]=std::max(.05,g.velocity_std_mps[j]);
+            }
+            if(observation.heading) {
+                observation.heading_rad=g.heading_rad;
+                observation.heading_std=std::max(.5*pi/180,g.heading_std_rad);
+                observation.baseline_yaw=g.baseline_yaw_frd_rad;
+            }
         }
         c->engine->addImuData(coreImu(imu));
-        c->engine->newImuProcess();
+        tmnav::GnssAiding::process(*c->engine,update?&observation:nullptr,c->aiding_stats);
         if(!c->engine->healthy()) { ++c->stats.numerical_faults; return error(c,NAV_NUMERICAL_FAULT,true); }
         const unsigned branch=static_cast<unsigned>(c->engine->lastBranch());
         // Floating-point boundary comparisons must not silently consume a GNSS.
@@ -229,7 +268,14 @@ extern "C" NavStatus Nav_Process(NavContext *c, double now, uint32_t limit, uint
             c->latest.last_gnss_time_s=c->gnss[c->gnss_head].time_s;
             c->gnss_head=(c->gnss_head+1)%NAV_GNSS_CAPACITY; --c->gnss_size;
             ++c->stats.gnss_updates;
+            if(observation.position) ++c->stats.position_updates;
         }
+        c->stats.velocity_updates=c->aiding_stats.velocity_used;
+        c->stats.velocity_rejected=c->aiding_stats.velocity_rejected;
+        c->stats.heading_updates=c->aiding_stats.heading_used;
+        c->stats.heading_rejected=c->aiding_stats.heading_rejected;
+        c->stats.velocity_nis=c->aiding_stats.velocity_nis;
+        c->stats.heading_nis=c->aiding_stats.heading_nis;
         c->imu_head=(c->imu_head+1)%NAV_IMU_CAPACITY; --c->imu_size;
         ++c->stats.imu_processed; ++count;
         snapshot(c);

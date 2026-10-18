@@ -22,6 +22,12 @@ Port changes:
   stack sizing must be measured on the actual compiler/board.
 - Keep Joseph covariance update and full cross-covariances; no state reduction,
   covariance decimation, float conversion, or fast-math approximation.
+- Add `core/kf-gins/gnss_aiding.h`: firmware adaptation of this repository's
+  unchanged offline `tools/kf_gins_aided/aiding.h`. It retains antenna velocity
+  with rotational / Earth-rate lever correction, horizontal baseline azimuth,
+  conditional-innovation NIS gates and one feedback per merged epoch. Replace
+  exceptions with explicit rejection / engine-health status. The offline copy
+  remains a separate numerical reference; changes must update equivalence tests.
 - Initialize the empty GNSS slot; skip update classification when it is empty.
   This prevents the upstream `-1` sentinel from matching a legitimate time axis.
 - Replace process termination on bad covariance with a latched fault. Also
@@ -38,3 +44,7 @@ all 441 covariance entries, avoiding incompatible Eigen configuration across
 translation units. Cases include all four update branches, nonzero bias/scale,
 GNSS outage/recovery and 60 seconds from the upstream dataset. The equivalence
 test is not independent navigation truth or evidence of H7 execution speed.
+
+The read-only quaternion accessor returns internal qbn at the same epoch as the
+Euler/state snapshot. Real-time integration, encoding and UART ownership live
+outside the core; the accessor does not change upstream mathematics.

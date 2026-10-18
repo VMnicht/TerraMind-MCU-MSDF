@@ -37,10 +37,23 @@ typedef struct {
 typedef struct {
     double time_s, position_rad_m[3], std_ned_m[3];
 } NavGnss;
+
+enum { NAV_OBS_POSITION=1u, NAV_OBS_VELOCITY=2u, NAV_OBS_HEADING=4u };
+// One merged GPS epoch. Caller checks CRC, solution status, freshness, baseline
+// length and velocity latency BEFORE enqueueing; heading is measured baseline
+// azimuth, not course over ground. Unselected fields are ignored.
+typedef struct {
+    double time_s;
+    uint32_t fields;
+    double position_rad_m[3], position_std_m[3];
+    double velocity_ned_mps[3], velocity_std_mps[3];
+    double heading_rad, heading_std_rad, baseline_yaw_frd_rad;
+} NavObservation;
 typedef struct {
     uint64_t sequence;
     double state_time_s, publish_time_s, age_s, last_gnss_time_s;
     NavState state;
+    double quaternion_bn[4]; // w,x,y,z; copied from the same core epoch as state.
     double std[NAV_STATE_DIM]; // P,V,attitude,bg,ba,sg,sa; SI units as above.
     uint32_t issue_flags;     // Sticky since initialize; bit (1u << NavStatus).
 } NavOutput;
@@ -51,6 +64,8 @@ typedef struct {
     uint32_t numerical_faults, skipped_output_slots, issue_flags;
     uint32_t last_process_cycles, max_process_cycles, branch_max_cycles[4];
     uint64_t total_process_cycles, branch_count[4]; // 0=predict, 1/2=endpoint, 3=split.
+    uint64_t position_updates, velocity_updates, velocity_rejected, heading_updates, heading_rejected;
+    double velocity_nis, heading_nis; // Last attempted observation; -1 if unavailable.
     double last_state_time_s, last_publish_time_s, max_output_age_s;
     NavStatus last_error;
     uint8_t running, faulted;
@@ -63,8 +78,8 @@ size_t Nav_ContextSize(void);
 size_t Nav_ContextAlignment(void);
 NavContext *Nav_Construct(void *aligned_memory, size_t bytes);
 void Nav_Destroy(NavContext *context);
-// G365 vehicle noise / initial-uncertainty profile in SI units. Continual GNSS
-// updates remain position-only; no heading / Doppler update is enabled here.
+// G365 vehicle noise / initial-uncertainty profile in SI units. Observation
+// fields explicitly select position, Doppler velocity and/or baseline heading.
 // Initial navigation state and installation geometry still require the caller.
 void Nav_DefaultConfig(NavConfig *config);
 // Initial state must correspond to seed.time_s; seed is the preceding complete
@@ -73,6 +88,10 @@ void Nav_DefaultConfig(NavConfig *config);
 NavStatus Nav_Initialize(NavContext *, const NavConfig *, const NavImu *seed);
 NavStatus Nav_PushImu(NavContext *, const NavImu *);
 NavStatus Nav_PushGnss(NavContext *, const NavGnss *);
+// Merge same-epoch fields before calling; duplicate epochs are rejected.
+// Minimum velocity sigma 0.05 m/s; heading sigma 0.5 deg. NIS gates 16.27/10.83.
+// gnss_accepted/gnss_updates count merged epochs (including heading-only epochs).
+NavStatus Nav_PushObservation(NavContext *, const NavObservation *);
 // Caller supplies current measurement-domain time; processes at most max_samples.
 // Does not wait, sleep, or write logs. Drain sensor ingress before invoking this.
 NavStatus Nav_Process(NavContext *, double now_s, uint32_t max_samples, uint32_t *processed);

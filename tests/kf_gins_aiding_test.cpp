@@ -1,4 +1,13 @@
+#ifdef TEST_BOARD_AIDING
+#include "kf-gins/gnss_aiding.h"
+namespace tmnav {
+using AidingObservation=BoardObservation;
+using AidingStats=BoardAidingStats;
+}
+#define OfflineAiding GnssAiding
+#else
 #include "aiding.h"
+#endif
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -92,6 +101,14 @@ static void aidingUpdates() {
         CHECK(e->healthy() && e->lastBranch()==branch && count.heading_used==1 && count.velocity_used==1);
         Eigen::LDLT<Matrix21> factor(e->getCovariance());CHECK(factor.vectorD().minCoeff()>=0);
     }
+#ifdef TEST_BOARD_AIDING
+    // A near-vertical baseline has no observable azimuth; reject without an
+    // exception or a numerical fault.
+    o.initstate.euler=Vector3d(0,90*D2R,0);e.reset(new GIEngine(o));
+    a=AidingObservation{};a.heading=true;a.heading_std=D2R;
+    AidingStats vertical;OfflineAiding::update(*e,a,at,vertical);
+    CHECK(e->healthy() && vertical.heading_rejected==1 && vertical.heading_used==0);
+#endif
 }
 int main() {
     try {jacobians();unchangedBranches();aidingUpdates();std::cout<<"Jacobians, gates, wrap, lever, covariance, epoch branches passed\n";}

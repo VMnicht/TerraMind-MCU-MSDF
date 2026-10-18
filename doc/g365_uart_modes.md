@@ -14,7 +14,7 @@ Keil Watch：`g_gyro_calibration_debug.state` 为 0 等待、1 统计、2 完成
 
 `App_ImuGetLatest`、`g_g365_debug_sample` 和 `I` 记录保留原始量。`App_ImuGetCorrected` / `g_imu_corrected_debug` 提供 `delta_angle_raw_SI - stationary_rate * dt` 的独立调试结果，速度增量不改；使用前检查 `valid` 和时间。这里减去的是静止均值，包含地球自转，仅用于相对静止的显示/调试，不能直接当作 KF-GINS 输入。`App_ImuGetCalibration` 返回均值、逐帧标准差、比力均值与温度。
 
-未来接入导航时，先将均值/标准差转换到前右下轴系（标准差仅换轴、不变符号），用标定时的纬度和姿态调用 `Nav_InitialGyroBiasFromStatic`，去除地球自转投影后填入 `NavConfig.initial.gyro_bias`，仍给算法原始增量，由原有 EKF 统一补偿。不能同时再减静止均值。该辅助接口尚未接入实际导航流程，且不能以移动后的姿态代替标定时姿态。
+实时导航已将均值/标准差转换到前右下轴系（标准差仅换轴、不变符号），在静止启动对准时调用 `Nav_InitialGyroBiasFromStatic`，去除地球自转投影后填入初始陀螺零偏，仍给算法原始增量，由 EKF 统一补偿。不能同时再减静止均值。需保持静止直到导航初始化完成，使对准姿态对应标定姿态；见 [上车说明](navigation_vehicle_test.md)。独立旧日志回放保留其既有去均值参考方式。
 
 | 上位机模式 | BURST_CTRL1 | BURST_CTRL2 | 上位机 ATTI_CTRL | 字节 5–16 | 字节 17–28 |
 | --- | --- | --- | --- | --- | --- |

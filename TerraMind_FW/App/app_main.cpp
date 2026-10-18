@@ -18,6 +18,8 @@ static volatile uint32_t g_requested_imu_mode = IMU_CAPTURE_DEFAULT_MODE;
 static volatile uint32_t g_requested_delta_ctrl = IMU_CAPTURE_DELTA_CTRL;
 extern "C" volatile uint32_t g_imu_debug_stage = 0u;
 static GyroBiasCalibration g_calibration;
+static AppImuNavigationCallback g_navigation_callback=nullptr;
+extern "C" void App_ImuSetNavigationCallback(AppImuNavigationCallback callback) { g_navigation_callback=callback; }
 static_assert(IMU_GYRO_CALIBRATION_SECONDS>=1.0 && IMU_GYRO_CALIBRATION_SECONDS<=30.0,
               "Startup calibration duration must be between 1 and 30 seconds");
 static uint64_t g_previous_drdy_ticks = 0;
@@ -88,6 +90,10 @@ static void on_imu_sample(const G365Imu::Sample &sample, void *)
         g_imu_corrected_debug.valid = 1;
     }
     Monitor_OnImuTimedSample(sample,matched ? &drdy : NULL,uart_ticks);
+    if(g_navigation_callback)g_navigation_callback(drdy.ticks,dt,angle,velocity,
+        continuous && dt>=.004 && dt<=.006 && (sample.flag&0x0101)==0 &&
+        sample.mode==G365Imu::Mode::Delta32 && ctrl==IMU_CAPTURE_DELTA_CTRL,
+        &g_gyro_calibration_debug);
 }
 
 extern "C" uint8_t App_ImuInit(void)

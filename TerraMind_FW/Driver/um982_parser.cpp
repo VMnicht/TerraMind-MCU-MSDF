@@ -141,6 +141,7 @@ bool parse_bestnav(char **header, char **body, uint32_t received_at_ms,
         !parse_byte(body[13], out.satellites_tracked) ||
         !parse_byte(body[14], out.satellites_used) ||
         !parse_float(body[23], out.velocity_latency_s) ||
+        !parse_float(body[24], out.velocity_age_s) ||
         !parse_float(body[25], out.horizontal_speed_mps) ||
         !parse_float(body[26], out.track_deg) ||
         !parse_float(body[27], out.vertical_speed_mps) ||
@@ -268,6 +269,7 @@ void Um982Parser::parse_line(uint32_t received_at_ms)
         }
         position_ = parsed;
         has_position_ = true;
+        if(callback_)callback_(&position_,nullptr,callback_user_);
         ++stats_.bestnav_messages;
     }
     else
@@ -281,6 +283,7 @@ void Um982Parser::parse_line(uint32_t received_at_ms)
         }
         heading_ = parsed;
         has_heading_ = true;
+        if(callback_)callback_(nullptr,&heading_,callback_user_);
         ++stats_.heading_messages;
     }
 }

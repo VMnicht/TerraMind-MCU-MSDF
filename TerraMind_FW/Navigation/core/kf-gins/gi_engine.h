@@ -28,6 +28,7 @@ public:
     void newImuProcess();
     double timestamp() const { return timestamp_; }
     NavState getNavState();
+    const Eigen::Quaterniond &getQuaternion() const { return pvacur_.att.qbn; }
     const Matrix21 &getCovariance() const { return Cov_; }
     bool healthy() const { return healthy_; }
     int lastBranch() const { return last_branch_; }
@@ -49,6 +50,7 @@ private:
     // Offline-only observation experiments reuse this full 21-state engine.
     // The friend has no definition in firmware targets and adds no state/code there.
     friend class OfflineAiding;
+    friend class GnssAiding;
     void initialize(const NavState &, const NavState &);
     void imuCompensate(IMU &);
     int isToUpdate(double, double, double) const;

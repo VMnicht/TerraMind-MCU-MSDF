@@ -35,6 +35,8 @@ void App_Um982Step(void);
 uint8_t App_Um982GetPosition(Um982Position *position);
 uint8_t App_Um982GetHeading(Um982Heading *heading);
 void App_Um982GetStats(Um982AppStats *stats);
+typedef void (*AppGnssNavigationCallback)(const Um982Position *,const Um982Heading *);
+void App_Um982SetNavigationCallback(AppGnssNavigationCallback callback);
 
 #ifdef __cplusplus
 }

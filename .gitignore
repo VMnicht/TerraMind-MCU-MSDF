@@ -19,3 +19,6 @@ Thumbs.db
 
 # Standalone navigation verification artifacts (never sensor logs)
 build-navigation/
+
+# Navigation monitor recordings (retain locally, do not commit measurement data)
+captures/navigation/

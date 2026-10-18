@@ -36,6 +36,7 @@ typedef struct
     uint8_t satellites_tracked;
     uint8_t satellites_used;
     float velocity_latency_s;
+    float velocity_age_s;
     float horizontal_speed_mps;
     float track_deg; /* Ground track; unreliable as heading at near-zero speed. */
     float vertical_speed_mps; /* Positive upward. */
@@ -77,6 +78,8 @@ public:
     bool get_position(Um982Position &out) const;
     bool get_heading(Um982Heading &out) const;
     Um982ParserStats get_stats() const;
+    typedef void (*MessageCallback)(const Um982Position *,const Um982Heading *,void *);
+    void set_callback(MessageCallback callback,void *user) { callback_=callback;callback_user_=user; }
 
 private:
     enum { LINE_CAPACITY = 384 };
@@ -87,6 +90,8 @@ private:
     Um982ParserStats stats_;
     bool has_position_;
     bool has_heading_;
+    MessageCallback callback_=nullptr;
+    void *callback_user_=nullptr;
 
     void parse_line(uint32_t received_at_ms);
 };

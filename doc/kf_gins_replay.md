@@ -14,7 +14,7 @@
 
 界面提供“持续双天线航向更新（离线实验）”和“GNSS 多普勒速度更新（含杆臂）”两个开关，当前车载调优预设默认均打开。均关闭时仍运行原版 `KF-GINS` 可执行文件；任一打开时运行独立的 `tools/kf_gins_aided` 程序。旧安装 JSON 无需增加字段，读取时两个开关默认为关闭；新 JSON 保存 `heading_aiding` / `velocity_aiding`。开关变化只对下一次运行生效，当前结果的说明不会被改变。
 
-先运行 `powershell -ExecutionPolicy Bypass -File tools/build_kf_gins_aided.ps1` 编译并自测增强程序，输出在 `build-navigation/aided/Release/`。增强程序复用板端封装内的完整双精度 21 状态内核、惯导机械编排、噪声和 IMU 零偏/比例因子估计；读取同一份 YAML，保留所有初始标准差及自定义噪声参数。核心头文件只增加离线访问声明，增强代码未加入固件工程，也未接入实时任务。上游子模块不改动。
+先运行 `powershell -ExecutionPolicy Bypass -File tools/build_kf_gins_aided.ps1` 编译并自测增强程序，输出在 `build-navigation/aided/Release/`。增强程序复用板端封装内的完整双精度 21 状态内核、惯导机械编排、噪声和 IMU 零偏/比例因子估计；读取同一份 YAML，保留所有初始标准差及自定义噪声参数。该 PC 程序及其原观测实现保留为独立对照。2026-10-18 已增加无异常/无堆分配的板端观测实现及 `Nav_PushObservation`，见 [H7 联合回放测试](navigation_h7_replay.md)；默认固件采集任务仍未接入导航。上游子模块不改动。
 
 - **航向**：只用实际 `UNIHEADINGA` GPS 历元，要求整数固定解、标准差不超过 5°，基线长度相对本段固定解中位数偏差不超过 `max(5 cm, 20%)`。假设天线基线在车体水平面，方向来自安装偏角；先用完整姿态旋转基线，再预测导航系方位角，不把俯仰/横滚时的基线方位直接等同于车头欧拉角。标准差下限 0.5°；一维 NIS 门限 10.83。诊断界面中的插值航向不会进入滤波。
 - **速度**：解析 BESTNAVA 的水平速度、航迹角、上向速度及垂直/水平速度标准差，转为 NED 速度。要求有效 DOPPLER_VELOCITY、有限值、水平标准差 ≤1 m/s、垂直标准差 ≤2 m/s。当前增量仅接受速度 latency/age 为零的历元；非零值明确拒绝并计数，尚未添加跨历元速度对齐。水平标准差作为 N/E 各轴标准差，三轴下限 0.05 m/s；三维 NIS 门限 16.27。

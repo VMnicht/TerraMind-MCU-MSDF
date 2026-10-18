@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "../../TerraMind_FW/App/app_tasks.h"
+#include "../../TerraMind_FW/App/app_navigation.h"
 
 /* USER CODE END Includes */
 
@@ -55,7 +56,7 @@ osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
   .stack_size = 1536 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t) osPriorityAboveNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,6 +99,7 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
+  AppNavigation_StartTask();
   if (defaultTaskHandle == NULL)
   {
     g_boot_stage = 0xB00700E1u;

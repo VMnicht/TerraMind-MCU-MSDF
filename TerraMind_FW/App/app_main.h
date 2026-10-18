@@ -4,9 +4,15 @@
 #include <stdint.h>
 #include "gyro_bias_calibration.h"
 
+typedef void (*AppImuNavigationCallback)(uint64_t ticks, double dt_s,
+    const double angle_xyz[3], const double velocity_xyz[3], uint8_t valid,
+    const GyroCalibrationResult *calibration);
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+void App_ImuSetNavigationCallback(AppImuNavigationCallback callback);
 
 typedef enum
 {

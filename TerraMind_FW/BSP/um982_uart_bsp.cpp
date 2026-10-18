@@ -16,13 +16,17 @@ Um982UartBsp &Um982UartBsp::instance()
 bool Um982UartBsp::arm_receive()
 {
     if (uart_ == NULL) return false;
-    if (HAL_UART_Receive_IT(uart_, &receive_byte_, 1u) != HAL_OK)
+    // Prevent an already pending UART error from interrupting HAL's receive
+    // setup; service() also trusts actual HAL state instead of a stale flag.
+    const uint32_t mask=__get_PRIMASK();__disable_irq();
+    const HAL_StatusTypeDef status=HAL_UART_Receive_IT(uart_, &receive_byte_, 1u);
+    armed_=uart_->RxState!=HAL_UART_STATE_READY;
+    __set_PRIMASK(mask);
+    if (status != HAL_OK)
     {
         ++rearm_error_count_;
-        armed_ = false;
         return false;
     }
-    armed_ = true;
     return true;
 }
 
@@ -40,7 +44,7 @@ bool Um982UartBsp::start(UART_HandleTypeDef *uart)
 
 void Um982UartBsp::service()
 {
-    if (!armed_ && uart_ != NULL && uart_->RxState == HAL_UART_STATE_READY)
+    if (uart_ != NULL && uart_->RxState == HAL_UART_STATE_READY)
     {
         arm_receive();
     }
